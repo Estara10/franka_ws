@@ -1,0 +1,67 @@
+<mujoco model="panda scene">
+
+  <include file="mj_dual.xml"/>
+  
+  <include file="objects.xml"/>
+
+  <statistic center="0.3 0 0.4" extent="1"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6"  ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
+        height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+        rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+        reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ========================================== -->
+    <!--            自定义环境：桌子与物体            -->
+    <!-- ========================================== -->
+
+    <!-- 1. 桌子 (Table) -->
+    <!-- 假设机器人基座在 z=0，我们将桌子表面设在 z=0.4m 处，位于机器人前方 -->
+    <body name="table" pos="0.5 0 0.2">
+      <!-- 桌腿或底座 (可选，这里直接悬空或是个实心台子) -->
+      <!-- size参数是半长(half-size)：x=0.25(长0.5), y=0.5(宽1.0), z=0.14(高0.28) -->
+      <geom type="box" size="0.25 0.6 0.14" rgba="0.6 0.4 0.2 1" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- 2. 长条物体 (Long Bar Object) -->
+    <!-- 目标：长40cm，重0.5kg，铝合金材质 -->
+    <!-- 位置：放在桌子正上方 z=0.4 + 0.02(物体半高) + 0.01(安全间隙) -->
+    <!-- 方向：沿着 Y 轴放置 (横向)，方便左右手同时抓取 -->
+    <body name="long_bar" pos="0.5 0 0.45">
+      <!-- freejoint 使物体受重力影响并可以被移动 -->
+      <freejoint/>
+      <!-- 惯性参数：明确指定质量为 0.5kg -->
+      <!-- diaginertia 必须满足 A+B >= C, B+C >= A, C+A >= B (三角不等式) -->
+      <!-- 长条物体：长 0.4m (Y轴), 宽 0.04m (X轴), 高 0.04m (Z轴) -->
+      <!-- 对于均匀长方体：Ix ≈ m*(Ly²+Lz²)/12, Iy ≈ m*(Lx²+Lz²)/12, Iz ≈ m*(Lx²+Ly²)/12 -->
+      <inertial pos="0 0 0" mass="0.5" diaginertia="0.00268 0.00268 0.00003"/>
+      <!-- 几何体：Box -->
+      <!-- size(半长): x=0.02(厚4cm), y=0.2(长40cm), z=0.02(高4cm) -->
+      <!-- friction: 增加摩擦力以利于抓取 (滑动摩擦 1.5) -->
+      <!-- solimp/solref: 接触刚度参数，防止穿模 -->
+      <geom name="bar_geom" type="box" size="0.02 0.2 0.02" 
+          rgba="0.8 0.8 0.9 1" 
+          friction="1.5 0.005 0.0001"
+          solimp="0.95 0.99 0.001" solref="0.002 1"/>
+      <!-- [关键] 添加 Site 标记点，用于 MoveIt/Python 脚本识别抓取位置 -->
+      <!-- 左侧抓取点 (相对于物体中心左偏 10cm) -->
+      <site name="grasp_site_left" pos="0 0.1 0" size="0.01" rgba="1 0 0 0.5"/>
+      <!-- 右侧抓取点 (相对于物体中心右偏 10cm) -->
+      <site name="grasp_site_right" pos="0 -0.1 0" size="0.01" rgba="0 1 0 0.5"/>
+    </body>
+  </worldbody>
+</mujoco>
