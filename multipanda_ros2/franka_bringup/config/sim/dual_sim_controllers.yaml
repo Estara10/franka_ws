@@ -74,9 +74,9 @@ dual_joint_impedance_example_controller:
         - 2.0
         - 2.0
         - 2.0
-        - 1.0
-        - 1.0
-        - 1.0
+        - 0.5
+        - 0.5
+        - 0.5
         - 0.5
     arm_2:
       arm_id: mj_right
@@ -92,9 +92,9 @@ dual_joint_impedance_example_controller:
         - 2.0
         - 2.0
         - 2.0
-        - 1.0
-        - 1.0
-        - 1.0
+        - 0.5
+        - 0.5
+        - 0.5
         - 0.5
     
 dual_joint_velocity_example_controller:
@@ -151,7 +151,24 @@ dual_panda_arm_controller:
       - velocity
     state_publish_rate: 100.0
     action_monitor_rate: 20.0
-    allow_partial_joints_goal: false
+    allow_partial_joints_goal: true
     constraints:
       stopped_velocity_tolerance: 0.01
       goal_time: 0.0
+    gains:
+      # PID参数：平衡响应速度和稳定性
+      mj_left_joint1:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_left_joint2:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_left_joint3:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_left_joint4:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_left_joint5:  {p: 180.0, i: 0.05, d: 25.0, i_clamp: 0.3}
+      mj_left_joint6:  {p: 180.0, i: 0.05, d: 25.0, i_clamp: 0.3}
+      mj_left_joint7:  {p: 90.0,  i: 0.01, d: 12.0, i_clamp: 0.1}
+
+      mj_right_joint1:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_right_joint2:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_right_joint3:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_right_joint4:  {p: 450.0, i: 0.05, d: 50.0, i_clamp: 0.3}
+      mj_right_joint5:  {p: 180.0, i: 0.05, d: 25.0, i_clamp: 0.3}
+      mj_right_joint6:  {p: 180.0, i: 0.05, d: 25.0, i_clamp: 0.3}
+      mj_right_joint7:  {p: 90.0,  i: 0.01, d: 12.0, i_clamp: 0.1}

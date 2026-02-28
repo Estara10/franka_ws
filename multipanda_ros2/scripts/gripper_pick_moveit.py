@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#MoveIt2 规划版夹取系统。严格借助 MoveIt2 的规划框架
+#会自动把夹爪和桌面作为碰撞体（CollisionObject）加进去，带有约束的完整夹取版本流程。
 """
 双臂机械夹取系统 - MoveIt2规划版本
 

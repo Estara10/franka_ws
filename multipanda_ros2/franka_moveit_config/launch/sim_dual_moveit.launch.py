@@ -67,16 +67,24 @@ def generate_launch_description():
     initial_positions_1_param = 'initial_positions_1'
     initial_positions_2_param = 'initial_positions_2'
     use_rviz_param = 'use_rviz'
+    launch_mujoco_param = 'launch_mujoco'
 
     arm_id_1 = LaunchConfiguration(arm_id_1_param)
     arm_id_2 = LaunchConfiguration(arm_id_2_param)
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
-    
+    use_rviz = LaunchConfiguration(use_rviz_param)
+    launch_mujoco = LaunchConfiguration(launch_mujoco_param)
 
     # Command-line arguments
     db_arg = DeclareLaunchArgument(
         'db', default_value='False', description='Database flag'
+    )
+    launch_mujoco_arg = DeclareLaunchArgument(
+        launch_mujoco_param, default_value='true', description='Launch MuJoCo server'
+    )
+    use_rviz_arg = DeclareLaunchArgument(
+        use_rviz_param, default_value='true', description='Launch RViz'
     )
 
     # Fixed variables
@@ -228,7 +236,8 @@ def generate_launch_description():
                 'verbose': "true",
                 'ns': '',
                 'mujoco_plugin_config': ros2_controllers_path
-            }.items()
+            }.items(),
+            condition=IfCondition(launch_mujoco)
         )
 
     # Load controllers
@@ -294,18 +303,22 @@ def generate_launch_description():
         description='Initial joint positions of robot 2. Must be enclosed in quotes, and in pure number.'
                     'Defaults to the "communication_test" pose.')
     
-    return LaunchDescription(
-        [arm_id_1_arg,
-         arm_id_2_arg,
-         initial_pose_1_arg,
-         initial_pose_2_arg,
-         db_arg,
-         rviz_node,
-         robot_state_publisher,
-         run_move_group_node,
-         mujoco_ros2_node,
-         mongodb_server_node,
-         joint_state_publisher
-         ]
-        + load_controllers
-    )
+    ld_nodes = [
+        arm_id_1_arg,
+        arm_id_2_arg,
+        initial_pose_1_arg,
+        initial_pose_2_arg,
+        db_arg,
+        launch_mujoco_arg,
+        use_rviz_arg,
+        rviz_node,
+        robot_state_publisher,
+        run_move_group_node,
+        mongodb_server_node,
+        joint_state_publisher
+    ]
+    
+    # mujoco_ros2_node always included - IfCondition will handle it at runtime
+    ld_nodes.append(mujoco_ros2_node)
+    
+    return LaunchDescription(ld_nodes + load_controllers)

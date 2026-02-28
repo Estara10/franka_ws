@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#simple_joint_test.py：基础关节空间测试脚本。给定几个固定的关节角度（JointState），
+# 测试机械臂能否通过 MoveIt 动作服务器转到指定姿态。
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient

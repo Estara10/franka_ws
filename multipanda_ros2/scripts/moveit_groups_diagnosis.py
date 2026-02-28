@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#moveit_groups_diagnosis.py：检查 MoveIt2 启动后的 /move_group 参数，
+# 诊断 planning_groups（规划组定义如左臂、右臂、双臂等）加载是否正常。
 import rclpy
 from rclpy.node import Node
 
