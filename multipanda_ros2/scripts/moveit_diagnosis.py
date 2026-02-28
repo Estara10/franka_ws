@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#靶向消息诊断。用于在发送动作目标（Goal）前检查目标位姿（Pose）和约束消息（Constraints）拼装是否合法。
 import rclpy
 from rclpy.node import Node
 from moveit_msgs.srv import GetPlanningScene

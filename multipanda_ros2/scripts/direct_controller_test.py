@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#直接控制器测试。它跳过了 MoveIt2，直接把关节轨迹 (FollowJointTrajectory Action) 下发给底层硬件或仿真器。
+# 用来验证是否是规划器的问题（排查“规划成功但手臂不动”的问题）。
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient

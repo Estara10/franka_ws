@@ -253,14 +253,21 @@ void GripperSimActionServer::onExecuteGripperCommand(
   const auto kGoal = goal_handle->get_goal();
   const double kTargetWidth = 2 * kGoal->command.position;
 
-  std::unique_lock<std::mutex> guard(gripper_state_mutex_);
+  double kCurrentWidth = 0.0;
+  double kMaxWidth = 0.0;
+  {
+    std::lock_guard<std::mutex> guard(gripper_state_mutex_);
+    kCurrentWidth = current_gripper_state_.width;
+    kMaxWidth = current_gripper_state_.max_width;
+  }
+
   constexpr double kSamePositionThreshold = 1e-4;
   auto result = std::make_shared<control_msgs::action::GripperCommand::Result>();
-  const double kCurrentWidth = current_gripper_state_.width;
-  if (kTargetWidth > current_gripper_state_.max_width || kTargetWidth < 0) {
+
+  if (kTargetWidth > kMaxWidth || kTargetWidth < 0) {
     RCLCPP_ERROR(this->get_logger(),
                  "GripperServer: Commanding out of range width! max_width = %f command = %f",
-                 current_gripper_state_.max_width, kTargetWidth);
+                 kMaxWidth, kTargetWidth);
     goal_handle->abort(result);
     return;
   }
@@ -272,7 +279,7 @@ void GripperSimActionServer::onExecuteGripperCommand(
     goal_handle->succeed(result);
     return;
   }
-  // guard.unlock();
+
   auto command = [kTargetWidth, kCurrentWidth, kGoal, this]() {
     if (kTargetWidth >= kCurrentWidth) {
       return simGripperMove(kTargetWidth, default_speed_);

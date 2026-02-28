@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#基础笛卡尔空间测试脚本。给定空间中的某个坐标和姿态（PoseStamped），测试机械臂能否进行位姿规划
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient

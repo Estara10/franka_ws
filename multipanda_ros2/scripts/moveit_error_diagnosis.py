@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#moveit_error_diagnosis.py：专门捕获和诊断 MoveIt2 返回的错误码（例如由于碰撞检测或无法求取逆运动学导致的规划失败）。
 """
 MoveIt2 错误码诊断脚本
 """

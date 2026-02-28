@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#以 50Hz 的高频监控并记录 TF2 坐标变换池 (TF buffer) 的同步延迟和误差，常用于排查双臂动作不同步的问题。
 import rclpy
 import csv
 import matplotlib.pyplot as plt
