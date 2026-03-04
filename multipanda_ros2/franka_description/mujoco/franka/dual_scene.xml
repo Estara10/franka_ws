@@ -33,7 +33,15 @@
     <!-- 假设机器人基座在 z=0，我们将桌子表面设在 z=0.4m 处，位于机器人前方 -->
     <body name="table" pos="0.5 0 0.2">
       <!-- size参数是半长(half-size)：x=0.25(长0.5), y=0.5(宽1.0), z=0.14(高0.28) -->
-      <geom type="box" size="0.25 0.6 0.14" rgba="0.6 0.4 0.2 1" friction="1 0.005 0.0001"/>
+      <geom type="box" size="0.25 0.6 0.14" rgba="0.6 0.4 0.2 1" friction="0.6 0.003 0.0001"/>
+      <!-- 额外桌面硬碰撞层：抑制“物体慢慢陷入桌面” -->
+      <geom name="table_top_collision" type="box"
+            pos="0 0 0.135" size="0.25 0.6 0.005"
+            rgba="0 0 0 0"
+            friction="0.8 0.01 0.0001"
+            solref="0.003 1"
+            solimp="0.995 0.999 0.0001 0.8 2"
+            margin="0.001"/>
     </body>
 
     
@@ -48,15 +56,17 @@
       <!-- diaginertia 必须满足 A+B >= C, B+C >= A, C+A >= B (三角不等式) -->
       <!-- 长条物体：长 0.4m (Y轴), 宽 0.04m (X轴), 高 0.04m (Z轴) -->
       <!-- 对于均匀长方体：Ix ≈ m*(Ly²+Lz²)/12, Iy ≈ m*(Lx²+Lz²)/12, Iz ≈ m*(Lx²+Ly²)/12 -->
-      <inertial pos="0 0 0" mass="0.5" diaginertia="0.00268 0.00268 0.00003"/>
+      <inertial pos="0 0 0" mass="0.10" diaginertia="0.00055 0.00055 0.00001"/>
       <!-- 几何体：Box -->
       <!-- size(半长): x=0.02(厚4cm), y=0.2(长40cm), z=0.02(高4cm) -->
       <!-- friction: 增加摩擦力以利于抓取 (滑动摩擦 1.5) -->
       <!-- solimp/solref: 接触刚度参数，防止穿模 -->
       <geom name="bar_geom" type="box" size="0.02 0.2 0.02" 
           rgba="0.8 0.8 0.9 1" 
-          friction="1.5 0.005 0.0001"
-          solimp="0.95 0.99 0.001" solref="0.002 1"/>
+          friction="12.0 2.5 0.05"
+          condim="6"
+          margin="0.004"
+          solref="0.003 1" solimp="0.988 0.999 0.0005 0.75 2"/>
       <!-- [关键] 添加 Site 标记点，用于 MoveIt/Python 脚本识别抓取位置 -->
       <!-- 左侧抓取点 (相对于物体中心左偏 10cm) -->
       <site name="grasp_site_left" pos="0 0.1 0" size="0.01" rgba="1 0 0 0.5"/>

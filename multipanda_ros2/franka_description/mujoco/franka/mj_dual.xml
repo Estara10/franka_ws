@@ -20,19 +20,19 @@
       <default class="collision">
         <geom type="mesh" group="3"/>
         <default class="fingertip_pad_collision_1">
-          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"/>
+          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445" friction="16.0 2.5 0.04" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2" margin="0.003"/>
         </default>
         <default class="fingertip_pad_collision_2">
-          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05" friction="16.0 2.5 0.04" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2" margin="0.003"/>
         </default>
         <default class="fingertip_pad_collision_3">
-          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05" friction="16.0 2.5 0.04" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2" margin="0.003"/>
         </default>
         <default class="fingertip_pad_collision_4">
-          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395" friction="16.0 2.5 0.04" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2" margin="0.003"/>
         </default>
         <default class="fingertip_pad_collision_5">
-          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395" friction="16.0 2.5 0.04" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2" margin="0.003"/>
         </default>
       </default>
     </default>
@@ -241,7 +241,7 @@
                           <joint name="mj_left_finger_joint1" class="finger"/>
                           <geom mesh="finger_0" material="off_white" class="visual"/>
                           <geom mesh="finger_1" material="black" class="visual"/>
-                          <geom mesh="finger_0" class="collision"/>
+                          <geom name="mj_left_left_finger_collision" mesh="finger_0" class="collision" friction="14.0 2.0 0.03" condim="6"/>
                           <geom class="fingertip_pad_collision_1"/>
                           <geom class="fingertip_pad_collision_2"/>
                           <geom class="fingertip_pad_collision_3"/>
@@ -254,7 +254,7 @@
                           <joint name="mj_left_finger_joint2" class="finger"/>
                           <geom mesh="finger_0" material="off_white" class="visual"/>
                           <geom mesh="finger_1" material="black" class="visual"/>
-                          <geom mesh="finger_0" class="collision"/>
+                          <geom name="mj_left_right_finger_collision" mesh="finger_0" class="collision" friction="14.0 2.0 0.03" condim="6"/>
                           <geom class="fingertip_pad_collision_1"/>
                           <geom class="fingertip_pad_collision_2"/>
                           <geom class="fingertip_pad_collision_3"/>
@@ -392,7 +392,7 @@
                           <joint name="mj_right_finger_joint1" class="finger"/>
                           <geom mesh="finger_0" material="off_white" class="visual"/>
                           <geom mesh="finger_1" material="black" class="visual"/>
-                          <geom mesh="finger_0" class="collision"/>
+                          <geom name="mj_right_left_finger_collision" mesh="finger_0" class="collision" friction="14.0 2.0 0.03" condim="6"/>
                           <geom class="fingertip_pad_collision_1"/>
                           <geom class="fingertip_pad_collision_2"/>
                           <geom class="fingertip_pad_collision_3"/>
@@ -405,7 +405,7 @@
                           <joint name="mj_right_finger_joint2" class="finger"/>
                           <geom mesh="finger_0" material="off_white" class="visual"/>
                           <geom mesh="finger_1" material="black" class="visual"/>
-                          <geom mesh="finger_0" class="collision"/>
+                          <geom name="mj_right_right_finger_collision" mesh="finger_0" class="collision" friction="14.0 2.0 0.03" condim="6"/>
                           <geom class="fingertip_pad_collision_1"/>
                           <geom class="fingertip_pad_collision_2"/>
                           <geom class="fingertip_pad_collision_3"/>
@@ -429,6 +429,10 @@
   <contact>
     <exclude body1="mj_left_link7" body2="mj_left_link8"/>
     <exclude body1="mj_right_link7" body2="mj_right_link8"/>
+    <pair geom1="bar_geom" geom2="mj_left_left_finger_collision" friction="18.0 3.0 0.05" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2"/>
+    <pair geom1="bar_geom" geom2="mj_left_right_finger_collision" friction="18.0 3.0 0.05" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2"/>
+    <pair geom1="bar_geom" geom2="mj_right_left_finger_collision" friction="18.0 3.0 0.05" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2"/>
+    <pair geom1="bar_geom" geom2="mj_right_right_finger_collision" friction="18.0 3.0 0.05" condim="6" solref="0.003 1" solimp="0.985 0.999 0.0005 0.7 2"/>
     
   </contact>
 
@@ -474,8 +478,8 @@
     <velocity name="mj_left_act_vel6" joint="mj_left_joint6" kv="1"/>
     <velocity name="mj_left_act_vel7" joint="mj_left_joint7" kv="1"/>
 
-    <general class="panda" name="mj_left_act_gripper" tendon="mj_left_split" forcerange="-100 100" ctrlrange="0 255"
-        gainprm="0.01568627451 0 0" biasprm="0 -100 -10"/>
+    <general class="panda" name="mj_left_act_gripper" tendon="mj_left_split" forcerange="-220 220" ctrlrange="0 255"
+        gainprm="0.25 0 0" biasprm="0 -1400 -35"/>
     
     <motor name="mj_right_act_trq1" joint="mj_right_joint1" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="mj_right_act_trq2" joint="mj_right_joint2" ctrlrange="-87 87" ctrllimited="true"/>
@@ -501,8 +505,8 @@
     <velocity name="mj_right_act_vel6" joint="mj_right_joint6" kv="1"/>
     <velocity name="mj_right_act_vel7" joint="mj_right_joint7" kv="1"/>
 
-    <general class="panda" name="mj_right_act_gripper" tendon="mj_right_split" forcerange="-100 100" ctrlrange="0 255"
-        gainprm="0.01568627451 0 0" biasprm="0 -100 -10"/>
+    <general class="panda" name="mj_right_act_gripper" tendon="mj_right_split" forcerange="-220 220" ctrlrange="0 255"
+        gainprm="0.25 0 0" biasprm="0 -1400 -35"/>
   </actuator>
 
 
