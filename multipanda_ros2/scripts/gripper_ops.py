@@ -9,6 +9,18 @@ from control_msgs.action import GripperCommand
 
 
 class GripperOpsMixin:
+    def _action_status_is_success_local(self, status: int) -> bool:
+        checker = getattr(self, '_action_status_is_success', None)
+        if callable(checker):
+            try:
+                return bool(checker(status))
+            except Exception:
+                pass
+        try:
+            return int(status) == GoalStatus.STATUS_SUCCEEDED
+        except Exception:
+            return False
+
     def _gripper_warn_once(self, key: str, message: str):
         warned = getattr(self, '_gripper_warned_keys', set())
         if key in warned:
@@ -127,7 +139,7 @@ class GripperOpsMixin:
                 stalled=None,
                 source='move_action',
             )
-            return move_success or status in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED)
+            return move_success or self._action_status_is_success_local(status)
         except Exception:
             return False
 
@@ -166,8 +178,7 @@ class GripperOpsMixin:
             if not wait_for_result:
                 return True
             result = await asyncio.wait_for(goal_handle.get_result_async(), timeout=4.0)
-            return int(getattr(result, 'status', -1)) in (
-                GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED)
+            return self._action_status_is_success_local(int(getattr(result, 'status', -1)))
         except Exception:
             return False
 
@@ -306,10 +317,14 @@ class GripperOpsMixin:
                         command_ok = True
                     elif result.status == GoalStatus.STATUS_ABORTED:
                         cur_opening = self.get_gripper_opening_estimate(side)
-                        self.get_logger().warn(
-                            f"{side}夹爪{action_desc}返回 ABORTED(6)，当前指关节={cur_opening}")
-                        # 在仿真中 ABORTED 也常伴随实际运动，先视为软成功
-                        command_ok = True
+                        if self._action_status_is_success_local(result.status):
+                            self.get_logger().warn(
+                                f"{side}夹爪{action_desc}返回 ABORTED(6)，demo 模式按软成功处理，当前指关节={cur_opening}")
+                            command_ok = True
+                        else:
+                            self.get_logger().warn(
+                                f"{side}夹爪{action_desc}返回 ABORTED(6)，eval 模式判定失败，当前指关节={cur_opening}")
+                            command_ok = False
                     else:
                         self.get_logger().warn(
                             f"{side}夹爪{action_desc}完成但状态异常={result.status}, "

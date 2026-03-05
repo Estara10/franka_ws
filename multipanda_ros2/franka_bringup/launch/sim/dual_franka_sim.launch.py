@@ -50,12 +50,30 @@ def generate_launch_description():
     initial_positions_1_param = 'initial_positions_1'
     initial_positions_2_param = 'initial_positions_2'
     use_rviz_param = 'use_rviz'
+    publish_fallback_target_tf_param = 'publish_fallback_target_tf'
+    fallback_bar_x_param = 'fallback_bar_x'
+    fallback_bar_y_param = 'fallback_bar_y'
+    fallback_bar_z_param = 'fallback_bar_z'
+    fallback_bar_yaw_param = 'fallback_bar_yaw'
+    mujoco_verbose_param = 'mujoco_verbose'
+    mujoco_headless_param = 'mujoco_headless'
+    mujoco_realtime_param = 'mujoco_realtime'
+    mujoco_threads_param = 'mujoco_threads'
 
     arm_id_1 = LaunchConfiguration(arm_id_1_param)
     arm_id_2 = LaunchConfiguration(arm_id_2_param)
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
+    publish_fallback_target_tf = LaunchConfiguration(publish_fallback_target_tf_param)
+    fallback_bar_x = LaunchConfiguration(fallback_bar_x_param)
+    fallback_bar_y = LaunchConfiguration(fallback_bar_y_param)
+    fallback_bar_z = LaunchConfiguration(fallback_bar_z_param)
+    fallback_bar_yaw = LaunchConfiguration(fallback_bar_yaw_param)
+    mujoco_verbose = LaunchConfiguration(mujoco_verbose_param)
+    mujoco_headless = LaunchConfiguration(mujoco_headless_param)
+    mujoco_realtime = LaunchConfiguration(mujoco_realtime_param)
+    mujoco_threads = LaunchConfiguration(mujoco_threads_param)
 
     # Fixed variables
     load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
@@ -90,7 +108,7 @@ def generate_launch_description():
         executable='robot_state_publisher',
         output='screen',
         namespace= ns,
-        parameters=[params]
+        parameters=[params, {'use_sim_time': True}]
     )
 
     # Joint state publisher setup
@@ -106,7 +124,47 @@ def generate_launch_description():
             namespace= ns,
             parameters=[
                 {'source_list': jsp_source_list,
-                 'rate': 30}],
+                 'rate': 30,
+                 'use_sim_time': True}],
+    )
+
+    # 兜底TF（默认启用）：
+    # - base_link -> long_bar（默认桌面中心位姿）
+    # - long_bar -> target_bar（零偏移别名）
+    # 这样即使感知/外部TF未启动，任务脚本也能立即拿到目标帧。
+    node_long_bar_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='fallback_long_bar_tf_pub',
+        arguments=[
+            '--x', fallback_bar_x,
+            '--y', fallback_bar_y,
+            '--z', fallback_bar_z,
+            '--roll', '0.0',
+            '--pitch', '0.0',
+            '--yaw', fallback_bar_yaw,
+            '--frame-id', 'base_link',
+            '--child-frame-id', 'long_bar',
+        ],
+        output='screen',
+        condition=IfCondition(publish_fallback_target_tf),
+    )
+    node_target_bar_alias_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='fallback_target_bar_tf_pub',
+        arguments=[
+            '--x', '0.0',
+            '--y', '0.0',
+            '--z', '0.0',
+            '--roll', '0.0',
+            '--pitch', '0.0',
+            '--yaw', '0.0',
+            '--frame-id', 'long_bar',
+            '--child-frame-id', 'target_bar',
+        ],
+        output='screen',
+        condition=IfCondition(publish_fallback_target_tf),
     )
 
     # Others
@@ -120,6 +178,51 @@ def generate_launch_description():
             use_rviz_param,
             default_value='false',
             description='Visualize the robot in Rviz'),
+        DeclareLaunchArgument(
+            publish_fallback_target_tf_param,
+            default_value='true',
+            description='Publish fallback base_link->long_bar and long_bar->target_bar static TFs.'
+        ),
+        DeclareLaunchArgument(
+            fallback_bar_x_param,
+            default_value='0.5',
+            description='Fallback long_bar x in base_link frame.'
+        ),
+        DeclareLaunchArgument(
+            fallback_bar_y_param,
+            default_value='0.0',
+            description='Fallback long_bar y in base_link frame.'
+        ),
+        DeclareLaunchArgument(
+            fallback_bar_z_param,
+            default_value='0.36',
+            description='Fallback long_bar z in base_link frame.'
+        ),
+        DeclareLaunchArgument(
+            fallback_bar_yaw_param,
+            default_value='0.0',
+            description='Fallback long_bar yaw (rad) in base_link frame.'
+        ),
+        DeclareLaunchArgument(
+            mujoco_verbose_param,
+            default_value='true',
+            description='MuJoCo server verbose log level.'
+        ),
+        DeclareLaunchArgument(
+            mujoco_headless_param,
+            default_value='false',
+            description='Run MuJoCo in headless mode.'
+        ),
+        DeclareLaunchArgument(
+            mujoco_realtime_param,
+            default_value='1.0',
+            description='MuJoCo realtime factor (0,1], -1 as fast as possible.'
+        ),
+        DeclareLaunchArgument(
+            mujoco_threads_param,
+            default_value='2',
+            description='MuJoCo simulation thread count.'
+        ),
         DeclareLaunchArgument(
             arm_id_1_param,
             default_value='mj_left',
@@ -147,7 +250,10 @@ def generate_launch_description():
             launch_arguments={
                 'use_sim_time': "true",
                 'modelfile': xml_file,
-                'verbose': "true",
+                'verbose': mujoco_verbose,
+                'headless': mujoco_headless,
+                'realtime': mujoco_realtime,
+                'mujoco_threads': mujoco_threads,
                 'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
                 # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
@@ -158,11 +264,17 @@ def generate_launch_description():
         # Miscellaneous
         node_robot_state_publisher,
         node_joint_state_publisher,
+        node_long_bar_tf,
+        node_target_bar_alias_tf,
 
         Node( # RVIZ dependency
             package='controller_manager',
             executable='spawner',
-            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
+            arguments=[
+                'joint_state_broadcaster',
+                '-c', concatenate_ns(ns, 'controller_manager', True),
+                '--controller-manager-timeout', '120'
+            ],
             output='screen',
         ),
         Node(package='rviz2',

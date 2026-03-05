@@ -66,7 +66,12 @@ class StateOpsMixin:
                 self.get_logger().warn(f"{description}: 目标被拒绝")
                 return False
             result = await asyncio.wait_for(goal_handle.get_result_async(), timeout=duration + 12.0)
-            ok = int(getattr(result, 'status', -1)) in (4, 6)  # SUCCEEDED / ABORTED
+            status = int(getattr(result, 'status', -1))
+            checker = getattr(self, '_action_status_is_success', None)
+            if callable(checker):
+                ok = bool(checker(status))
+            else:
+                ok = (status == 4)
             self.get_logger().info(f"{description}: 执行{'成功' if ok else '失败'}(status={result.status})")
             return ok
         except Exception as e:
@@ -426,38 +431,41 @@ class StateOpsMixin:
         self.get_logger().info(">> State 2: plan_approach() - 动态 TF 获取与抓取点计算...")
         
         try:
-            # 尝试获取目标物体的 TF (先尝试 'target_bar', 若无则退回 'long_bar')
-            try:
-                tf_msg = self.tf_buffer.lookup_transform(self.planning_frame, 'target_bar', rclpy.time.Time())
-            except:
-                tf_msg = self.tf_buffer.lookup_transform(self.planning_frame, 'long_bar', rclpy.time.Time())
-                
+            # 统一入口：优先复用 execute_task_flow 已缓存的目标位姿；若为空再走 get_target_pose_async
+            target_pose = getattr(self, 'latest_target_pose', None)
+            if target_pose is None:
+                target_pose = await self.get_target_pose_async()
+            if target_pose is None:
+                raise RuntimeError("目标位姿为空")
+
+            self.latest_target_pose = target_pose
             p_center = np.array([
-                tf_msg.transform.translation.x,
-                tf_msg.transform.translation.y,
-                tf_msg.transform.translation.z
-            ])
+                target_pose.pose.position.x,
+                target_pose.pose.position.y,
+                target_pose.pose.position.z
+            ], dtype=float)
             
             q_bar = [
-                tf_msg.transform.rotation.x,
-                tf_msg.transform.rotation.y,
-                tf_msg.transform.rotation.z,
-                tf_msg.transform.rotation.w
+                target_pose.pose.orientation.x,
+                target_pose.pose.orientation.y,
+                target_pose.pose.orientation.z,
+                target_pose.pose.orientation.w
             ]
             r_bar = R.from_quat(q_bar)
             
-            self.get_logger().info(f"成功获取目标位姿: Center={p_center}")
+            pose_src = str(getattr(self, 'target_pose_source_frame', 'unknown'))
+            self.get_logger().info(f"成功获取目标位姿: Center={p_center}, source={pose_src}")
             
-            # 利用物体长度动态推算左抓取点和右抓取点
-            L = self.BAR_LENGTH
-            grasp_offset = 0.05 # 距端点的偏移量，使 L/2 - offset = 0.15m
-            
-            # P_left = P_center + R_bar * [0, L/2 - offset, 0]^T
-            local_vec_left = np.array([0.0, (L / 2) - grasp_offset, 0.0])
-            p_left = p_center + r_bar.apply(local_vec_left)
-            
-            # P_right = P_center - R_bar * [0, L/2 - offset, 0]^T
-            p_right = p_center - r_bar.apply(local_vec_left)
+            # 利用物体姿态动态推算抓取点：与 dual_scene.xml 的 grasp_site ±0.10m 对齐
+            # 关键防撞：平票走Y + 最小横向间距约束（统一走 test2.py 的安全计算函数）
+            p_left, p_right, grasp_meta = self._compute_safe_grasp_centers(p_center, r_bar)
+            self.get_logger().info(
+                f"抓取轴自动判定: {grasp_meta['axis_name']}, site_half_span={grasp_meta['span']:.3f}m, "
+                f"Y间距={grasp_meta['y_spacing_after']:.4f}m")
+            if grasp_meta['spacing_forced']:
+                self.get_logger().warn(
+                    f"预抓取防撞保护触发: Y间距从 {grasp_meta['y_spacing_before']:.4f}m "
+                    f"提升至 {grasp_meta['y_spacing_after']:.4f}m (最小要求 {grasp_meta['min_lateral_spacing']:.4f}m)")
 
             self.get_logger().info(f"动态推算左抓取点: {p_left}")
             self.get_logger().info(f"动态推算右抓取点: {p_right}")
@@ -472,8 +480,13 @@ class StateOpsMixin:
             )
             self.PRE_GRASP_HEIGHT = self.GRASP_Z + 0.10
             self.LIFT_HEIGHT = self.GRASP_Z + 0.12
-            left_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_left_z_offset', 0.0)))
-            right_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_right_z_offset', 0.0)))
+            base_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_z_offset', 0.0)))
+            if bool(getattr(self, 'enforce_level_pregrasp', True)):
+                left_pregrasp_z = base_pregrasp_z
+                right_pregrasp_z = base_pregrasp_z
+            else:
+                left_pregrasp_z = float(base_pregrasp_z + float(getattr(self, 'pregrasp_left_z_offset', 0.0)))
+                right_pregrasp_z = float(base_pregrasp_z + float(getattr(self, 'pregrasp_right_z_offset', 0.0)))
 
             # 缓存给 execute 阶段使用
             self.dynamic_p_left = p_left
@@ -540,13 +553,17 @@ class StateOpsMixin:
                 rp.pose.position.z = right_pregrasp_z
                 rp.pose.orientation = build_quat_msg(q_right_arr)
 
-                ik_l = await self.compute_ik_async(self._group_name('left'), lp, avoid_collisions=False)
-                ik_r = await self.compute_ik_async(self._group_name('right'), rp, avoid_collisions=False)
+                ik_l, vals_l = await self.compute_ik_natural_async(
+                    'left', lp, avoid_collisions=True, allow_collision_fallback=False, verbose=False)
+                ik_r, vals_r = await self.compute_ik_natural_async(
+                    'right', rp, avoid_collisions=True, allow_collision_fallback=False, verbose=False)
                 if ik_l is None or ik_r is None:
                     return -1e9, None, None
 
-                vals_l = extract_joint_values(ik_l, self.left_arm_joints)
-                vals_r = extract_joint_values(ik_r, self.right_arm_joints)
+                if vals_l is None:
+                    vals_l = extract_joint_values(ik_l, self.left_arm_joints)
+                if vals_r is None:
+                    vals_r = extract_joint_values(ik_r, self.right_arm_joints)
                 margin_l = min_margin(vals_l)
                 margin_r = min_margin(vals_r)
                 base_score = min(margin_l, margin_r)
@@ -557,13 +574,33 @@ class StateOpsMixin:
                 j7_l = vals_l[6]
                 j7_r = vals_r[6]
                 j7_penalty = 0.0
-                j7_soft = 2.60
+                j7_soft = 2.30
                 if abs(j7_l) > j7_soft:
-                    j7_penalty += (abs(j7_l) - j7_soft) * 2.0
+                    j7_penalty += (abs(j7_l) - j7_soft) * 3.0
                 if abs(j7_r) > j7_soft:
-                    j7_penalty += (abs(j7_r) - j7_soft) * 2.0
+                    j7_penalty += (abs(j7_r) - j7_soft) * 3.0
 
-                return base_score - j7_penalty, vals_l, vals_r
+                # 额外惩罚：偏离当前关节状态太大，会造成“预抓取姿态扭曲/突变”
+                current = getattr(self, 'current_joint_state', {})
+                delta_penalty = 0.0
+                if isinstance(current, dict) and current:
+                    for idx, jn in enumerate(self.left_arm_joints):
+                        if jn in current and idx < len(vals_l):
+                            delta_penalty += abs(float(vals_l[idx]) - float(current[jn]))
+                    for idx, jn in enumerate(self.right_arm_joints):
+                        if jn in current and idx < len(vals_r):
+                            delta_penalty += abs(float(vals_r[idx]) - float(current[jn]))
+                    delta_penalty *= 0.08
+
+                natural_penalty = 0.0
+                natural_scale = max(0.0, float(getattr(self, 'natural_ik_pregrasp_penalty_scale', 0.18)))
+                if natural_scale > 0.0:
+                    natural_penalty = natural_scale * (
+                        float(self._compute_joint_naturalness_cost('left', vals_l)) +
+                        float(self._compute_joint_naturalness_cost('right', vals_r))
+                    )
+
+                return base_score - j7_penalty - delta_penalty - natural_penalty, vals_l, vals_r
 
             best = {
                 'score': -1e9,
@@ -620,6 +657,7 @@ class StateOpsMixin:
             self.right_pre_grasp.pose.position.y = p_right[1]
             self.right_pre_grasp.pose.position.z = right_pregrasp_z
             self.right_pre_grasp.pose.orientation = self.grasp_orientation_right
+            self.state2_used_fallback_pregrasp = False
             
             self.current_state = TaskState.EXECUTE_APPROACH
 
@@ -640,8 +678,13 @@ class StateOpsMixin:
                 ), 0.38)
                 self.PRE_GRASP_HEIGHT = self.GRASP_Z + 0.12
                 self.LIFT_HEIGHT = self.GRASP_Z + 0.15
-                left_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_left_z_offset', 0.0)))
-                right_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_right_z_offset', 0.0)))
+                base_pregrasp_z = float(self.PRE_GRASP_HEIGHT + float(getattr(self, 'pregrasp_z_offset', 0.0)))
+                if bool(getattr(self, 'enforce_level_pregrasp', True)):
+                    left_pregrasp_z = base_pregrasp_z
+                    right_pregrasp_z = base_pregrasp_z
+                else:
+                    left_pregrasp_z = float(base_pregrasp_z + float(getattr(self, 'pregrasp_left_z_offset', 0.0)))
+                    right_pregrasp_z = float(base_pregrasp_z + float(getattr(self, 'pregrasp_right_z_offset', 0.0)))
 
                 q_fallback = Quaternion(x=0.9239, y=0.3827, z=0.0, w=0.0)
                 self.grasp_orientation_left = getattr(self, 'grasp_orientation_left', q_fallback)
@@ -660,6 +703,7 @@ class StateOpsMixin:
                 self.right_pre_grasp.pose.position.y = float(p_right[1])
                 self.right_pre_grasp.pose.position.z = right_pregrasp_z
                 self.right_pre_grasp.pose.orientation = self.grasp_orientation_right
+                self.state2_used_fallback_pregrasp = True
                 self.current_state = TaskState.EXECUTE_APPROACH
                 return
             self.current_state = TaskState.ERROR
@@ -667,6 +711,27 @@ class StateOpsMixin:
     async def state_execute_approach(self):
         """State 3: 规划并移动到预抓取点和抓取点"""
         self.get_logger().info(">> State 3: execute_approach() - 双臂安全平移并下探至抓取位置...")
+        strict_pregrasp = bool(getattr(self, 'strict_pregrasp_gate', True))
+        force_continue = bool(self._is_force_continue_enabled())
+        target_pose_from_tf = bool(getattr(self, 'target_pose_from_tf', False))
+        state2_used_fallback = bool(getattr(self, 'state2_used_fallback_pregrasp', False))
+        demo_soft_pregrasp_gate = (
+            force_continue and (
+                (not strict_pregrasp) or
+                (not target_pose_from_tf) or
+                state2_used_fallback
+            )
+        )
+        if demo_soft_pregrasp_gate and strict_pregrasp:
+            reason = []
+            if not target_pose_from_tf:
+                reason.append('目标TF缺失')
+            if state2_used_fallback:
+                reason.append('State2兜底抓点')
+            if not reason:
+                reason.append('demo容错模式')
+            self.get_logger().warn(
+                f"预抓取门控降级为软判定({'+'.join(reason)})：偏差告警但不中断流程")
         
         # === 第一步：移动到预抓取点（高于铝条 15cm）===
         # 使用收紧的容差，防止 IK 求解器选择变形的关节配置
@@ -674,7 +739,7 @@ class StateOpsMixin:
             self.left_pre_grasp, self.right_pre_grasp,
             pos_tol=0.02, ori_tol_x=0.05, ori_tol_y=0.05, ori_tol_z=0.08)
         if not success_pre:
-            if self._is_force_continue_enabled():
+            if demo_soft_pregrasp_gate:
                 self.get_logger().warn("预抓取点移动失败，中期兜底：跳过预抓取，直接尝试下探")
             else:
                 self.get_logger().error("预抓取点移动失败，触发复位")
@@ -684,7 +749,7 @@ class StateOpsMixin:
         # 关节健壮性检查：到达预抓取点后，确认没有接近限位的变形配置
         await asyncio.sleep(0.3)  # 等待关节状态更新
         if not self.check_joint_sanity():
-            if self._is_force_continue_enabled():
+            if demo_soft_pregrasp_gate:
                 self.get_logger().warn("预抓取后关节角接近限位，中期兜底：降速继续并尽快完成夹取")
             else:
                 self.get_logger().error("预抓取后关节角接近限位，配置可能变形！触发复位")
@@ -731,7 +796,7 @@ class StateOpsMixin:
                         ori_tol_z=0.06,
                         max_retries=2,
                     )
-                    if not refine_ok and not self._is_force_continue_enabled():
+                    if not refine_ok and (not demo_soft_pregrasp_gate):
                         self.get_logger().error("预抓取精对齐失败，终止下探")
                         self.current_state = TaskState.ERROR
                         return
@@ -740,7 +805,11 @@ class StateOpsMixin:
             self.get_logger().warn(f"预抓取精对齐检查异常: {e}")
 
         # 预抓取强制几何对齐（可选，默认关闭）：在极端偏差场景下可启用
-        if bool(getattr(self, 'enable_pregrasp_force_align', False)):
+        run_force_align = bool(getattr(self, 'enable_pregrasp_force_align', False))
+        if run_force_align and demo_soft_pregrasp_gate and (not target_pose_from_tf or state2_used_fallback):
+            self.get_logger().warn("检测到 TF 缺失/兜底抓点：跳过预抓取强制几何对齐，避免误判触发复位")
+            run_force_align = False
+        if run_force_align:
             try:
                 left_chk, _ = await self.get_current_pose('mj_left_link8')
                 right_chk, _ = await self.get_current_pose('mj_right_link8')
@@ -808,14 +877,14 @@ class StateOpsMixin:
                             ]))
                             if (
                                 (left_xy_err2 > force_xy_tol or right_xy_err2 > force_xy_tol or z_gap2 > force_z_gap_tol)
-                                and not self._is_force_continue_enabled()
+                                and (not demo_soft_pregrasp_gate)
                             ):
                                 self.get_logger().error(
                                     f"预抓取强制对齐后仍偏差过大: L_xy={left_xy_err2:.4f}, "
                                     f"R_xy={right_xy_err2:.4f}, z_gap={z_gap2:.4f}")
                                 self.current_state = TaskState.ERROR
                                 return
-                        if not force_align_ok and not self._is_force_continue_enabled():
+                        if not force_align_ok and (not demo_soft_pregrasp_gate):
                             self.get_logger().error("预抓取强制对齐执行失败")
                             self.current_state = TaskState.ERROR
                             return
