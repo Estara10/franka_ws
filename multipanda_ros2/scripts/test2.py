@@ -31,9 +31,12 @@ from state_ops import StateOpsMixin
 class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
     def __init__(self, mode: str = 'auto'):
         super().__init__('dual_arm_task_node')
-        self.get_logger().info("=== 初始化基于 ROS2+MoveIt2+CHOMP 的双臂协作控制节点 ===")
+        self.get_logger().info("=== 初始化基于 ROS2+MoveIt2(OMPL+TOTG) 的双臂协作控制节点 ===")
         self.requested_mode = mode
         self.active_mode = 'auto'
+        self.allow_continue_without_gripper = False
+        self.gripper_wait_result = True
+        self.accept_aborted_as_success = False
         self.current_state = TaskState.INIT_ENVIRONMENT
         
         # --- 超时与控制参数 (Control Parameters) ---
@@ -71,6 +74,11 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         # 赋予初始全0状态防报错
         self.current_left_wrench = WrenchStamped()
         self.current_right_wrench = WrenchStamped()
+        # 目标位姿来源标记（用于 demo 模式下的预抓取门控策略）
+        self.target_pose_from_tf = False
+        self.target_pose_source_frame = 'unknown'
+        self.latest_target_pose = None
+        self.state2_used_fallback_pregrasp = False
         
         # 力控去皮 bias
         self.left_force_bias = {'y': 0.0, 'z': 0.0}
@@ -147,18 +155,33 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.grasp_cartesian_split_height = 0.030  # m, 大位移下探时插入中间航点
         self.grasp_cartesian_align_xy_first = True
         self.grasp_cartesian_waypoint_xy_tol = 0.003
-        self.pregrasp_align_xy_tol = 0.006
-        self.pregrasp_align_z_tol = 0.006
-        self.pregrasp_align_z_gap_tol = 0.006
-        self.pregrasp_refine_pos_tol = 0.008
-        self.pregrasp_left_z_offset = -0.004        # m, 左臂预抓取高度补偿（+更高，-更低）
-        self.pregrasp_right_z_offset = 0.001         # m, 右臂预抓取高度补偿（+更高，-更低）
+        self.pregrasp_align_xy_tol = 0.003
+        self.pregrasp_align_z_tol = 0.003
+        self.pregrasp_align_z_gap_tol = 0.002
+        self.pregrasp_refine_pos_tol = 0.004
+        self.pregrasp_z_offset = 0.0                # m, 双臂共用预抓取高度偏置
+        self.enforce_level_pregrasp = True          # 预抓取阶段双臂强制同高
+        self.strict_pregrasp_gate = True            # 预抓取验收不允许 demo 模式强行继续
+        self.pregrasp_left_z_offset = 0.0           # m, 仅在禁用同高策略时生效
+        self.pregrasp_right_z_offset = 0.0          # m, 仅在禁用同高策略时生效
         self.enable_pregrasp_force_align = True   # 起始规划稳态优先，必要时再开启强制对齐
         self.pregrasp_force_align_xy_tol = 0.003
-        self.pregrasp_force_align_z_gap_tol = 0.003
-        self.pregrasp_force_align_pos_tol = 0.004
+        self.pregrasp_force_align_z_gap_tol = 0.002
+        self.pregrasp_force_align_pos_tol = 0.003
         self.allow_flip_orientation_candidate = False  # 默认禁用180°翻转姿态候选
-        self.grasp_yaw_bias_max_deg = 4.0              # 姿态微调范围（度）
+        self.grasp_yaw_bias_max_deg = 2.0              # 姿态微调范围（度）
+        self.grasp_site_half_span = 0.10               # m, 对齐 dual_scene.xml grasp_site ±0.10m
+        self.grasp_axis_tie_eps = 1e-4                 # 抓取轴判定平票阈值（平票时强制走 local Y）
+        self.pregrasp_min_lateral_spacing = 0.16       # m, 预抓取最小横向(Y)间距，防止双臂落在同一中线
+        self.publish_mock_target_tf = False            # 默认不发布假 target_bar TF，避免覆盖真实 long_bar
+        # IK 构型自然化：多种子求解并偏向“接近 home + 远离限位”的解
+        self.enable_natural_ik_bias = True
+        self.natural_ik_soft_limit_margin = 0.25       # rad, 接近限位开始惩罚
+        self.natural_ik_hard_limit_margin = 0.12       # rad, 过近限位重惩罚
+        self.natural_ik_j7_soft_abs = 2.00             # rad, 手腕过大扭转惩罚阈值
+        self.natural_ik_current_delta_weight = 0.06    # 与当前姿态差异惩罚系数
+        self.natural_ik_home_weights = [0.7, 1.0, 0.6, 1.3, 0.4, 0.5, 0.9]
+        self.natural_ik_pregrasp_penalty_scale = 0.18
         self.transport_cartesian_max_step = 0.006
         self.transport_cartesian_retry_segment = 0.08
         self.transport_cartesian_one_shot_margin = 0.02
@@ -177,6 +200,9 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.moveit_joint_acc_scale = 0.07
         self.sync_plan_vel_scale = 0.12
         self.sync_plan_acc_scale = 0.07
+        self.sync_plan_joint_tolerance = 0.04         # rad, 同步 plan-only 关节目标容差
+        self.sync_plan_max_end_joint_error = 0.05     # rad, 轨迹末点相对 IK 目标的最大误差
+        self.sync_plan_allow_collision_ik_fallback = False
         self.sync_merge_time_scale = 1.50
         # 柔顺控制阻抗参数（低晃动优先）
         self.compliance_kd_z = 340.0
@@ -240,12 +266,14 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.grasp_z_safety_bias = 0.008
         # 在当前抓取基线上额外下探 2cm（根据实测“下降不够”问题）
         self.grasp_extra_descent = 0.020
-        # 根据当前 MoveIt 启动配置，仅启用 OMPL 与默认管线（避免无效 ompl_chomp 触发快速失败）
-        # 当前环境下 ompl pipeline 常返回 99999 快速失败；仅保留默认 pipeline 提高稳定性
+        # 当前默认使用 MoveIt2 默认规划管线（OMPL）+ 请求适配器 TOTG。
+        # 如后续确实接入 CHOMP/STOMP，请在 move_group 侧显式配置 planning_pipelines 后再追加候选。
         self.sync_plan_pipeline_candidates = ['']
         self.action_wait_poll_sec = 1.0
         self.action_wait_total_sec = 20.0
         self.service_wait_total_sec = 8.0
+        self.target_tf_retry_count = 2
+        self.target_tf_retry_interval_sec = 0.2
 
 
     def _joint_state_cb(self, msg):
@@ -259,42 +287,292 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
     def _right_force_cb(self, msg: WrenchStamped):
         self.current_right_wrench = msg
 
+    def _compute_safe_grasp_centers(self, center_p: np.ndarray, target_rot: R):
+        """
+        统一抓取中心计算：
+        1) 抓取轴判定平票时强制选择 local Y；
+        2) 左臂固定在 +Y 侧；
+        3) 若横向间距不足，强制拉开最小 Y 间距，避免预抓取同中线碰撞。
+        """
+        span = float(getattr(self, 'grasp_site_half_span', 0.10))
+        tie_eps = max(1e-6, float(getattr(self, 'grasp_axis_tie_eps', 1e-4)))
+        min_lateral_spacing = max(0.02, float(getattr(self, 'pregrasp_min_lateral_spacing', 0.16)))
+
+        local_x_world = target_rot.apply([1.0, 0.0, 0.0])
+        local_y_world = target_rot.apply([0.0, 1.0, 0.0])
+        lx_h = np.array([local_x_world[0], local_x_world[1], 0.0], dtype=float)
+        ly_h = np.array([local_y_world[0], local_y_world[1], 0.0], dtype=float)
+        lx_norm = float(np.linalg.norm(lx_h))
+        ly_norm = float(np.linalg.norm(ly_h))
+
+        if abs(lx_norm - ly_norm) <= tie_eps:
+            half_length_vec_local = np.array([0.0, span, 0.0], dtype=float)
+            axis_name = 'local Y(tie-break)'
+        elif lx_norm > ly_norm:
+            half_length_vec_local = np.array([span, 0.0, 0.0], dtype=float)
+            axis_name = 'local X'
+        else:
+            half_length_vec_local = np.array([0.0, span, 0.0], dtype=float)
+            axis_name = 'local Y'
+
+        offset_vec_world = target_rot.apply(half_length_vec_local)
+        p_left = np.array(center_p - offset_vec_world, dtype=float)
+        p_right = np.array(center_p + offset_vec_world, dtype=float)
+
+        # 统一左右语义：left 固定在 +Y 侧，right 固定在 -Y 侧
+        if float(p_left[1]) < float(p_right[1]):
+            p_left, p_right = p_right, p_left
+
+        y_spacing_before = abs(float(p_left[1]) - float(p_right[1]))
+        spacing_forced = False
+        if y_spacing_before < min_lateral_spacing:
+            center_y = float(center_p[1])
+            half_gap = 0.5 * min_lateral_spacing
+            p_left[1] = center_y + half_gap
+            p_right[1] = center_y - half_gap
+            spacing_forced = True
+
+        y_spacing_after = abs(float(p_left[1]) - float(p_right[1]))
+        return p_left, p_right, {
+            'axis_name': axis_name,
+            'span': span,
+            'lx_norm': lx_norm,
+            'ly_norm': ly_norm,
+            'tie_eps': tie_eps,
+            'spacing_forced': spacing_forced,
+            'y_spacing_before': y_spacing_before,
+            'y_spacing_after': y_spacing_after,
+            'min_lateral_spacing': min_lateral_spacing,
+        }
+
+    def _action_status_is_success(self, status: int) -> bool:
+        """统一动作状态判定：评估模式只认 SUCCEEDED，演示模式可容忍 ABORTED。"""
+        try:
+            status_val = int(status)
+        except Exception:
+            return False
+        if status_val == GoalStatus.STATUS_SUCCEEDED:
+            return True
+        if status_val == GoalStatus.STATUS_ABORTED and bool(getattr(self, 'accept_aborted_as_success', False)):
+            return True
+        return False
+
     def _is_force_continue_enabled(self) -> bool:
         return bool(getattr(self, 'allow_continue_without_gripper', False))
 
-    async def get_target_pose_async(self, target_frame='target_bar', source_frame='base_link'):
+    def _joint_limits(self):
+        return [
+            (-2.8973, 2.8973),   # J1
+            (-1.7628, 1.7628),   # J2
+            (-2.8973, 2.8973),   # J3
+            (-3.0718, -0.0698),  # J4
+            (-2.8973, 2.8973),   # J5
+            (-0.0175, 3.7525),   # J6
+            (-2.8973, 2.8973),   # J7
+        ]
+
+    def _extract_joint_values(self, js, joint_names):
+        if js is None:
+            return None
+        if isinstance(js, dict):
+            vals = [js.get(n, None) for n in joint_names]
+            return vals if not any(v is None for v in vals) else None
+        if hasattr(js, 'name') and hasattr(js, 'position'):
+            name_to_pos = {n: p for n, p in zip(js.name, js.position)}
+            vals = [name_to_pos.get(n, None) for n in joint_names]
+            return vals if not any(v is None for v in vals) else None
+        return None
+
+    def _compute_joint_naturalness_cost(self, side: str, joint_values):
+        if joint_values is None or len(joint_values) < 7:
+            return 1e9
+
+        if side == 'left':
+            home = list(getattr(self, 'home_joint_positions_left', [0.0] * 7))
+            arm_joint_names = list(getattr(self, 'left_arm_joints', []))
+        else:
+            home = list(getattr(self, 'home_joint_positions_right', [0.0] * 7))
+            arm_joint_names = list(getattr(self, 'right_arm_joints', []))
+
+        weights = list(getattr(self, 'natural_ik_home_weights', [0.7, 1.0, 0.6, 1.3, 0.4, 0.5, 0.9]))
+        if len(weights) < 7:
+            weights = (weights + [1.0] * 7)[:7]
+
+        cost = 0.0
+        for i in range(7):
+            dv = float(joint_values[i]) - float(home[i])
+            cost += float(weights[i]) * dv * dv
+
+        limits = self._joint_limits()
+        soft_margin = max(0.02, float(getattr(self, 'natural_ik_soft_limit_margin', 0.25)))
+        hard_margin = max(0.01, min(soft_margin, float(getattr(self, 'natural_ik_hard_limit_margin', 0.12))))
+        for i in range(7):
+            lo, hi = limits[i]
+            v = float(joint_values[i])
+            margin = min(v - lo, hi - v)
+            if margin < soft_margin:
+                dm = soft_margin - margin
+                cost += dm * dm * 12.0
+            if margin < hard_margin:
+                dm2 = hard_margin - margin
+                cost += 2.5 + dm2 * dm2 * 80.0
+
+        j7_soft = max(0.1, float(getattr(self, 'natural_ik_j7_soft_abs', 2.0)))
+        j7_abs = abs(float(joint_values[6]))
+        if j7_abs > j7_soft:
+            dj = j7_abs - j7_soft
+            cost += dj * dj * 10.0
+
+        current_delta_w = max(0.0, float(getattr(self, 'natural_ik_current_delta_weight', 0.06)))
+        if current_delta_w > 0.0 and isinstance(getattr(self, 'current_joint_state', None), dict):
+            for i, jn in enumerate(arm_joint_names):
+                if jn in self.current_joint_state:
+                    cost += current_delta_w * abs(float(joint_values[i]) - float(self.current_joint_state[jn]))
+
+        return float(cost)
+
+    def _build_ik_seed_candidates(self, side: str):
+        candidates = []
+
+        if isinstance(getattr(self, 'current_joint_state', None), dict) and self.current_joint_state:
+            names = list(self.current_joint_state.keys())
+            positions = [float(self.current_joint_state[n]) for n in names]
+            candidates.append(('current', names, positions))
+
+        all_arm_joints = list(getattr(self, 'all_arm_joints', []))
+        if all_arm_joints:
+            home_map = {}
+            for idx, jn in enumerate(getattr(self, 'left_arm_joints', [])):
+                if idx < len(getattr(self, 'home_joint_positions_left', [])):
+                    home_map[jn] = float(self.home_joint_positions_left[idx])
+            for idx, jn in enumerate(getattr(self, 'right_arm_joints', [])):
+                if idx < len(getattr(self, 'home_joint_positions_right', [])):
+                    home_map[jn] = float(self.home_joint_positions_right[idx])
+
+            home_positions = [float(home_map.get(jn, 0.0)) for jn in all_arm_joints]
+            candidates.append(('home', all_arm_joints, home_positions))
+
+            if isinstance(getattr(self, 'current_joint_state', None), dict) and self.current_joint_state:
+                side_set = set(getattr(self, 'left_arm_joints', []) if side == 'left' else getattr(self, 'right_arm_joints', []))
+                blended = []
+                for jn in all_arm_joints:
+                    cur = float(self.current_joint_state.get(jn, home_map.get(jn, 0.0)))
+                    hm = float(home_map.get(jn, cur))
+                    if jn in side_set:
+                        blended.append(0.6 * cur + 0.4 * hm)
+                    else:
+                        blended.append(cur)
+                candidates.append(('blend_side_home', all_arm_joints, blended))
+
+        if not candidates:
+            candidates.append(('default', None, None))
+        return candidates
+
+    async def compute_ik_natural_async(self, side: str, pose: PoseStamped,
+                                       avoid_collisions: bool = True,
+                                       allow_collision_fallback: bool = False,
+                                       verbose: bool = True):
+        group_name = self._group_name(side)
+        joint_names = self.left_arm_joints if side == 'left' else self.right_arm_joints
+        use_bias = bool(getattr(self, 'enable_natural_ik_bias', True))
+        seed_candidates = self._build_ik_seed_candidates(side) if use_bias else [('default', None, None)]
+
+        best = None
+        for seed_label, seed_names, seed_positions in seed_candidates:
+            ik_js = await self.compute_ik_async(
+                group_name,
+                pose,
+                avoid_collisions=avoid_collisions,
+                seed_joint_names=seed_names,
+                seed_joint_positions=seed_positions,
+            )
+            if ik_js is None:
+                continue
+
+            vals = self._extract_joint_values(ik_js, joint_names)
+            if vals is None:
+                continue
+
+            cost = self._compute_joint_naturalness_cost(side, vals) if use_bias else 0.0
+            if best is None or cost < best['cost']:
+                best = {
+                    'js': ik_js,
+                    'vals': vals,
+                    'cost': float(cost),
+                    'seed': seed_label,
+                }
+
+        if best is None and avoid_collisions and allow_collision_fallback:
+            return await self.compute_ik_natural_async(
+                side,
+                pose,
+                avoid_collisions=False,
+                allow_collision_fallback=False,
+                verbose=verbose,
+            )
+
+        if best is None:
+            return None, None
+
+        if verbose:
+            self.get_logger().info(
+                f"[{side}臂] IK自然择优: seed={best['seed']}, "
+                f"avoid_collisions={avoid_collisions}, cost={best['cost']:.3f}")
+        return best['js'], best['vals']
+
+    async def get_target_pose_async(self, target_frame='long_bar', source_frame='base_link', fallback_frame='target_bar'):
         """
         [动态感知修复] 使用异步监听获取目标物体的精确位姿。
         取代硬编码的 BAR_CENTER_X/Y/Z。
         """
-        self.get_logger().info(f"正在从 TF 获取 '{target_frame}' 位姿...")
         pose = PoseStamped()
         pose.header.frame_id = source_frame
-        
-        # 尝试最多 5 次获取 TF
-        for _ in range(5):
-            try:
-                # 检查 TF 是否可用
-                now = rclpy.time.Time()
-                trans = self.tf_buffer.lookup_transform(source_frame, target_frame, now, timeout=rclpy.duration.Duration(seconds=1.0))
-                
-                pose.pose.position.x = trans.transform.translation.x
-                pose.pose.position.y = trans.transform.translation.y
-                pose.pose.position.z = trans.transform.translation.z
-                pose.pose.orientation = trans.transform.rotation
-                
-                self.get_logger().info(f"✓ 成功获取 '{target_frame}' 位姿: [{pose.pose.position.x:.3f}, {pose.pose.position.y:.3f}, {pose.pose.position.z:.3f}]")
-                return pose
-            except Exception as e:
-                self.get_logger().warn(f"TF 获取失败 ({e}), 正在重试...")
-                await asyncio.sleep(0.5)
-        
+        self.target_pose_from_tf = False
+        self.target_pose_source_frame = 'unknown'
+        frames = [target_frame]
+        if fallback_frame and fallback_frame != target_frame:
+            frames.append(fallback_frame)
+
+        retry_count = max(1, int(getattr(self, 'target_tf_retry_count', 2)))
+        retry_interval = max(0.01, float(getattr(self, 'target_tf_retry_interval_sec', 0.2)))
+
+        # 尝试获取 TF（优先 long_bar，失败再退回 target_bar）
+        for frame in frames:
+            self.get_logger().info(f"正在从 TF 获取 '{frame}' 位姿...")
+            for _ in range(retry_count):
+                try:
+                    now = rclpy.time.Time()
+                    trans = self.tf_buffer.lookup_transform(
+                        source_frame, frame, now,
+                        timeout=rclpy.duration.Duration(seconds=1.0)
+                    )
+
+                    pose.pose.position.x = trans.transform.translation.x
+                    pose.pose.position.y = trans.transform.translation.y
+                    pose.pose.position.z = trans.transform.translation.z
+                    pose.pose.orientation = trans.transform.rotation
+
+                    self.get_logger().info(
+                        f"✓ 成功获取 '{frame}' 位姿: "
+                        f"[{pose.pose.position.x:.3f}, {pose.pose.position.y:.3f}, {pose.pose.position.z:.3f}]"
+                    )
+                    self.target_pose_from_tf = True
+                    self.target_pose_source_frame = str(frame)
+                    self.latest_target_pose = pose
+                    return pose
+                except Exception as e:
+                    self.get_logger().warn(f"TF 获取失败 ({e}), 正在重试...")
+                    await asyncio.sleep(retry_interval)
+
         # 兜底：如果 TF 彻底不可用，返回一个合理的默认位姿
-        self.get_logger().error(f"无法获取 '{target_frame}' 的 TF，使用备选硬编码位姿！")
+        self.get_logger().error(f"无法获取 {frames} 的 TF，使用备选硬编码位姿！")
         pose.pose.position.x = 0.5
         pose.pose.position.y = 0.0
         pose.pose.position.z = 0.36
         pose.pose.orientation.w = 1.0
+        self.target_pose_from_tf = False
+        self.target_pose_source_frame = 'hardcoded_fallback'
+        self.latest_target_pose = pose
         return pose
 
     def check_joint_sanity(self, side: str = 'both', warn_margin: float = 0.087, fail_margin: float = 0.02) -> bool:
@@ -342,16 +620,52 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         return all_ok
 
     async def configure_mode_async(self):
-        # 强制使用最宽松的模式，保证中期视频能录完
-        self.active_mode = 'auto'
-        self.allow_continue_without_gripper = True
-        self.gripper_wait_result = False
-        # 中期模式下放宽急停触发，但保持平滑优先的伺服速度上限
-        self.midterm_demo_mode = True
-        self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.045)
-        self.watchdog_force_limit = 130.0
-        self.watchdog_force_trip_count = 3
-        self.get_logger().info("中期演示模式已启动：所有流程将强制执行到底。")
+        requested = str(getattr(self, 'requested_mode', 'demo')).strip().lower()
+        if requested not in ('auto', 'demo', 'eval'):
+            self.get_logger().warn(f"未知模式 '{requested}'，回退到 demo 模式")
+            requested = 'demo'
+        if requested == 'auto':
+            requested = 'demo'
+
+        if requested == 'demo':
+            self.active_mode = 'demo'
+            self.allow_continue_without_gripper = True
+            self.gripper_wait_result = False
+            self.accept_aborted_as_success = True
+            self.midterm_demo_mode = True
+            self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.045)
+            self.watchdog_force_limit = 130.0
+            self.watchdog_force_trip_count = 3
+            # Demo 模式：预抓取门控采用软判定，避免毫米级误差触发整条任务失败
+            self.strict_pregrasp_gate = False
+            self.enable_pregrasp_force_align = True
+            self.pregrasp_align_xy_tol = max(float(getattr(self, 'pregrasp_align_xy_tol', 0.003)), 0.008)
+            self.pregrasp_align_z_tol = max(float(getattr(self, 'pregrasp_align_z_tol', 0.003)), 0.006)
+            self.pregrasp_align_z_gap_tol = max(float(getattr(self, 'pregrasp_align_z_gap_tol', 0.002)), 0.010)
+            self.pregrasp_refine_pos_tol = max(float(getattr(self, 'pregrasp_refine_pos_tol', 0.004)), 0.006)
+            self.pregrasp_force_align_xy_tol = max(float(getattr(self, 'pregrasp_force_align_xy_tol', 0.003)), 0.008)
+            self.pregrasp_force_align_z_gap_tol = max(float(getattr(self, 'pregrasp_force_align_z_gap_tol', 0.002)), 0.010)
+            self.pregrasp_force_align_pos_tol = max(float(getattr(self, 'pregrasp_force_align_pos_tol', 0.003)), 0.006)
+            self.get_logger().info(
+                "运行模式=demo：允许流程兜底继续；动作 ABORTED 视为软成功。")
+            return
+
+        self.active_mode = 'eval'
+        self.allow_continue_without_gripper = False
+        self.gripper_wait_result = True
+        self.accept_aborted_as_success = False
+        self.midterm_demo_mode = False
+        self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.035)
+        self.watchdog_force_limit = min(float(getattr(self, 'watchdog_force_limit', 130.0)), 100.0)
+        self.watchdog_force_trip_count = min(max(int(getattr(self, 'watchdog_force_trip_count', 3)), 1), 2)
+        self.strict_pregrasp_gate = True
+        self.pregrasp_align_xy_tol = min(float(getattr(self, 'pregrasp_align_xy_tol', 0.008)), 0.004)
+        self.pregrasp_align_z_tol = min(float(getattr(self, 'pregrasp_align_z_tol', 0.006)), 0.004)
+        self.pregrasp_align_z_gap_tol = min(float(getattr(self, 'pregrasp_align_z_gap_tol', 0.010)), 0.004)
+        self.pregrasp_force_align_xy_tol = min(float(getattr(self, 'pregrasp_force_align_xy_tol', 0.008)), 0.004)
+        self.pregrasp_force_align_z_gap_tol = min(float(getattr(self, 'pregrasp_force_align_z_gap_tol', 0.010)), 0.004)
+        self.get_logger().info(
+            "运行模式=eval：严格判定流程；动作仅 SUCCEEDED 才算成功。")
 
     def wait_for_servers(self):
         self.get_logger().info('等待动作服务器 (Action Servers)...')
@@ -707,7 +1021,8 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             return result.pose_stamped[0]
         return None
 
-    async def compute_ik_async(self, group_name: str, pose: PoseStamped, avoid_collisions: bool = True):
+    async def compute_ik_async(self, group_name: str, pose: PoseStamped, avoid_collisions: bool = True,
+                               seed_joint_names=None, seed_joint_positions=None):
         """
         调用 compute_ik 服务求解逆运动学。
 
@@ -723,9 +1038,16 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         req.ik_request.pose_stamped = pose
         req.ik_request.timeout.sec = 3
 
-        # 填入当前关节状态作为 IK 种子（而非默认全零）
-        # 这能显著提高 IK 成功率，并让结果更接近当前姿态（避免大跳变）
-        if self.current_joint_state:
+        # 优先使用显式传入的 IK 种子（例如 home/current blend），
+        # 否则退回当前关节状态作为默认种子。
+        if (
+            seed_joint_names is not None and seed_joint_positions is not None and
+            len(seed_joint_names) == len(seed_joint_positions) and len(seed_joint_names) > 0
+        ):
+            req.ik_request.robot_state.is_diff = False
+            req.ik_request.robot_state.joint_state.name = [str(n) for n in seed_joint_names]
+            req.ik_request.robot_state.joint_state.position = [float(v) for v in seed_joint_positions]
+        elif self.current_joint_state:
             req.ik_request.robot_state.is_diff = False
             req.ik_request.robot_state.joint_state.name = list(self.current_joint_state.keys())
             req.ik_request.robot_state.joint_state.position = list(self.current_joint_state.values())
@@ -811,30 +1133,20 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.get_logger().info(
             f"[{side}臂] 目标({p.x:.3f},{p.y:.3f},{p.z:.3f}) → 先求 IK ...")
 
-        # ── Step 1: IK 求解，最多重试 max_retries 次（每次稍微改变 avoid_collisions 策略）──
-        ik_solution = None
-        for attempt in range(1, max_retries + 1):
-            avoid_col = (attempt <= 2)  # 前两次启用碰撞检查，第三次关闭（找到可行解优先）
-            ik_solution = await self.compute_ik_async(group_name, pose, avoid_collisions=avoid_col)
-            if ik_solution:
-                self.get_logger().info(f"[{side}臂] IK 第{attempt}次求解成功 ✓")
-                break
-            self.get_logger().warn(f"[{side}臂] IK 第{attempt}/{max_retries}次求解失败，重试...")
-            await asyncio.sleep(0.1)
-
-        if not ik_solution:
+        # ── Step 1: IK 求解（多种子 + 自然构型择优）──
+        allow_collision_fallback = bool(max_retries > 2)
+        ik_solution, extracted_vals = await self.compute_ik_natural_async(
+            side,
+            pose,
+            avoid_collisions=True,
+            allow_collision_fallback=allow_collision_fallback,
+        )
+        if not ik_solution or not extracted_vals:
             self.get_logger().error(f"[{side}臂] IK 全部失败，目标位姿不可达 ✗")
             return False
 
         # 从 IK 结果里提取本臂的 7 个关节角
-        target_positions = []
-        for jn in joint_names:
-            try:
-                idx = list(ik_solution.name).index(jn)
-                target_positions.append(ik_solution.position[idx])
-            except ValueError:
-                self.get_logger().error(f"[{side}臂] IK 结果缺少关节 {jn}")
-                return False
+        target_positions = [float(v) for v in extracted_vals]
 
         # ── Step 2: 构造 JointConstraint 目标并规划 ──
         for attempt in range(1, max_retries + 1):
@@ -1082,7 +1394,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
                 return False
             exec_timeout = max(30.0, float(t_unified[-1]) + 20.0)
             result = await asyncio.wait_for(gh.get_result_async(), timeout=exec_timeout)
-            ok = result.status in [GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED]
+            ok = self._action_status_is_success(result.status)
             self.get_logger().info(f"合并轨迹执行{'成功' if ok else '失败'}(状态={result.status})")
             return ok
         except asyncio.TimeoutError:
@@ -1138,7 +1450,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             
             result = await asyncio.wait_for(gh.get_result_async(), timeout=15.0)
             self.get_logger().info(f"回到初始姿态完成，状态: {result.status}")
-            return result.status in [GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED]
+            return self._action_status_is_success(result.status)
         except Exception as e:
             self.get_logger().warn(f"回到初始姿态异常: {e}")
             return False
@@ -1188,24 +1500,24 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         group_name = self._group_name(side)
         joint_names = self.left_arm_joints if side == 'left' else self.right_arm_joints
 
-        # 先求 IK
-        target_js = await self.compute_ik_async(group_name, pose, avoid_collisions=False)
-        if not target_js:
+        # 先求 IK（多种子 + 自然构型择优）
+        allow_collision_fallback = bool(getattr(self, 'sync_plan_allow_collision_ik_fallback', False))
+        target_js, extracted_vals = await self.compute_ik_natural_async(
+            side,
+            pose,
+            avoid_collisions=True,
+            allow_collision_fallback=allow_collision_fallback,
+        )
+        if not target_js or not extracted_vals:
             self.get_logger().warn(f"[{side}] IK 求解失败，无法规划")
             return None
 
         # 提取对应关节的数值
-        name_to_pos = {n: p for n, p in zip(target_js.name, target_js.position)}
-        target_positions = []
-        for jn in joint_names:
-            if jn not in name_to_pos:
-                self.get_logger().warn(f"[{side}] IK 结果缺少关节 {jn}，同步规划失败")
-                return None
-            target_positions.append(name_to_pos[jn])
+        target_positions = [float(v) for v in extracted_vals]
 
         from moveit_msgs.msg import JointConstraint
         pipeline_candidates = getattr(
-            self, 'sync_plan_pipeline_candidates', ['ompl', ''])
+            self, 'sync_plan_pipeline_candidates', [''])
 
         error_code_map = {
             1: 'SUCCESS',
@@ -1248,12 +1560,13 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
             constraints = Constraints()
             constraints.name = "joint_goal"
+            joint_tol = max(0.005, float(getattr(self, 'sync_plan_joint_tolerance', 0.04)))
             for i, jn in enumerate(joint_names):
                 jc = JointConstraint()
                 jc.joint_name = jn
                 jc.position = target_positions[i]
-                jc.tolerance_above = 0.15
-                jc.tolerance_below = 0.15
+                jc.tolerance_above = joint_tol
+                jc.tolerance_below = joint_tol
                 jc.weight = 1.0
                 constraints.joint_constraints.append(jc)
             goal.request.goal_constraints.append(constraints)
@@ -1289,6 +1602,24 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             point_count = 0 if traj is None else len(getattr(traj, 'points', []))
 
             if err_val == 1 and point_count > 0:
+                try:
+                    end_positions = list(traj.points[-1].positions)
+                    if len(end_positions) == len(target_positions):
+                        max_end_err = max(
+                            abs(float(a) - float(b))
+                            for a, b in zip(end_positions, target_positions)
+                        )
+                        max_allowed = max(
+                            float(getattr(self, 'sync_plan_joint_tolerance', 0.04)),
+                            float(getattr(self, 'sync_plan_max_end_joint_error', 0.05)),
+                        )
+                        if max_end_err > max_allowed:
+                            self.get_logger().warn(
+                                f"[{side}] pipeline={pipe_name} 末点偏差过大: "
+                                f"max_end_err={max_end_err:.4f}rad > {max_allowed:.4f}rad，丢弃该轨迹")
+                            continue
+                except Exception:
+                    pass
                 self.get_logger().info(
                     f"[{side}] pipeline={pipe_name} 同步规划成功: status={status}, points={point_count}")
                 return traj
@@ -1302,8 +1633,8 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
     async def sync_move_arms_coordinated(self, left_pose, right_pose):
         """
-        第四阶段：真实闭链规划与 CHOMP 优化
-        由于已在底层集成 pipeline_id='ompl_chomp'，这里执行严格的主从跟踪算法：
+        第四阶段：闭链近似主从规划（当前基于 OMPL 规划输出）
+        这里执行主从跟踪算法：
         1. 主臂依靠 OMPL 规划出平滑的左臂 JointTrajectory。
         2. 基于左臂每一个插值后节点计算期望位姿 (FK) -> 加上左右臂物理约束增量 -> 计算右臂在同一时刻的必须位姿及其 IK。
         3. 合并成严格 14-DOF 同步轨迹发送给 dual 控制器。
@@ -1385,11 +1716,12 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             return False
             
         result = await asyncio.wait_for(gh.get_result_async(), timeout=30.0)
-        return result.status in [4, 5] # SUCCEEDED / ABORTED
+        return self._action_status_is_success(result.status)
 
 
     async def execute_task_flow(self):
-        self.get_logger().info("=== 开始双臂协同搬运任务 (ROS2 + MoveIt2 + CHOMP + 柔顺控制) ===")
+        self.get_logger().info(
+            f"=== 开始双臂协同搬运任务 (mode={self.active_mode}, ROS2 + MoveIt2(OMPL+TOTG) + 柔顺控制) ===")
 
         # 等待关节状态初始化
         for _ in range(30):
@@ -1399,22 +1731,20 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         # [第一阶段改造] 动态感知设置
         self.planning_frame = "base_link"
 
-        # --- [TF修复] 重新发布模拟的 target_bar TF，并统一坐标系 ---
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.planning_frame # 关键修复：父坐标系统一为 base_link
-        t.child_frame_id = 'target_bar'
-        # 物体相对于 base_link 的位置
-        t.transform.translation.x = 0.5
-        t.transform.translation.y = 0.0
-        t.transform.translation.z = 0.36
-        t.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t)
-        self.get_logger().info(f"已发布模拟的 'target_bar' 静态 TF (父坐标系: {self.planning_frame})。")
-        
-        # 短暂等待，确保 TF 在网络中广播
-        await asyncio.sleep(0.5)
-        # --- TF 发布结束 ---
+        # 若未启用视觉节点，可临时发布 mock TF；默认关闭以避免覆盖真实 long_bar 姿态
+        if bool(getattr(self, 'publish_mock_target_tf', False)):
+            t = TransformStamped()
+            t.header.stamp = self.get_clock().now().to_msg()
+            t.header.frame_id = self.planning_frame
+            t.child_frame_id = 'target_bar'
+            t.transform.translation.x = 0.5
+            t.transform.translation.y = 0.0
+            t.transform.translation.z = 0.36
+            t.transform.rotation.w = 1.0
+            self.tf_broadcaster.sendTransform(t)
+            self.get_logger().warn(
+                f"已发布 mock 'target_bar' 静态 TF (父坐标系: {self.planning_frame})。")
+            await asyncio.sleep(0.5)
 
         target_pose = await self.get_target_pose_async()
         if target_pose is None:
@@ -1422,6 +1752,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             self.current_state = TaskState.ERROR
             # 在进入主循环前就直接返回
             return
+        self.latest_target_pose = target_pose
         
         # [第一阶段改造] 基于物体实时位姿，动态计算双臂抓取点
         # 物体尺寸：长度0.4m (半长0.2m)
@@ -1436,20 +1767,21 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             target_orientation_q.w
         ])
 
-        # 计算沿物体局部X轴的半长向量
-        half_length_vec_local = np.array([self.BAR_LENGTH / 2.0, 0, 0])
-        
-        # 将半长向量旋转到世界坐标系
-        offset_vec_world = target_rot.apply(half_length_vec_local)
-
-        # 计算左右抓取点的中心位置
+        # 与 dual_scene.xml 抓取 site 对齐，并加入防撞保护（平票走Y + 最小横向间距）
         center_p = np.array([
             target_pose.pose.position.x,
             target_pose.pose.position.y,
             target_pose.pose.position.z
         ])
-        left_grasp_center = center_p - offset_vec_world
-        right_grasp_center = center_p + offset_vec_world
+        left_grasp_center, right_grasp_center, grasp_meta = self._compute_safe_grasp_centers(center_p, target_rot)
+        self.get_logger().info(
+            f"抓取轴判定={grasp_meta['axis_name']} "
+            f"(||lx_h||={grasp_meta['lx_norm']:.4f}, ||ly_h||={grasp_meta['ly_norm']:.4f}, eps={grasp_meta['tie_eps']:.1e}), "
+            f"Y间距={grasp_meta['y_spacing_after']:.4f}m")
+        if grasp_meta['spacing_forced']:
+            self.get_logger().warn(
+                f"预抓取防撞保护触发: Y间距从 {grasp_meta['y_spacing_before']:.4f}m "
+                f"提升至 {grasp_meta['y_spacing_after']:.4f}m (最小要求 {grasp_meta['min_lateral_spacing']:.4f}m)")
         
         # 为了后续状态机使用，将numpy数组存为成员变量
         self.left_grasp_center_pos = left_grasp_center
@@ -1462,20 +1794,16 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.TABLE_TOP_Z = 0.34
         self.BAR_RESTING_Z = target_pose.pose.position.z # 使用动态获取的高度
 
-        # 发布目标物体 target_bar 的静态 TF，模拟视觉感知节点
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.planning_frame
-        t.child_frame_id = 'target_bar'
-        t.transform.translation.x = self.BAR_CENTER_X
-        t.transform.translation.y = self.BAR_CENTER_Y
-        t.transform.translation.z = self.BAR_RESTING_Z
-        # 物体自身的相对姿态 (假设与世界对齐)
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 0.0
-        t.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t)
+        if bool(getattr(self, 'publish_mock_target_tf', False)):
+            t = TransformStamped()
+            t.header.stamp = self.get_clock().now().to_msg()
+            t.header.frame_id = self.planning_frame
+            t.child_frame_id = 'target_bar'
+            t.transform.translation.x = float(target_pose.pose.position.x)
+            t.transform.translation.y = float(target_pose.pose.position.y)
+            t.transform.translation.z = float(self.BAR_RESTING_Z)
+            t.transform.rotation = target_pose.pose.orientation
+            self.tf_broadcaster.sendTransform(t)
         
         # 物体尺寸：长度0.4m (半长0.2m), 截面 4cm x 4cm
         self.BAR_LENGTH = 0.40
@@ -1643,8 +1971,18 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = DualArmTaskNode()
+    cli_args = list(args) if args is not None else sys.argv[1:]
+    parser = argparse.ArgumentParser(description='Dual arm cooperative transport demo/eval runner.')
+    parser.add_argument(
+        '--mode',
+        choices=['auto', 'demo', 'eval'],
+        default='demo',
+        help='demo: 中期演示容错模式; eval: 严格评估模式'
+    )
+    parsed, ros_args = parser.parse_known_args(cli_args)
+
+    rclpy.init(args=ros_args)
+    node = DualArmTaskNode(mode=parsed.mode)
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
     import threading
