@@ -63,7 +63,7 @@
       <!-- solimp/solref: 接触刚度参数，防止穿模 -->
       <geom name="bar_geom" type="box" size="0.02 0.2 0.02" 
           rgba="0.8 0.8 0.9 1" 
-          friction="12.0 2.5 0.05"
+          friction="16.0 3.0 0.06"
           condim="6"
           margin="0.004"
           solref="0.003 1" solimp="0.988 0.999 0.0005 0.75 2"/>

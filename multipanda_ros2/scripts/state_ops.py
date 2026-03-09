@@ -4,7 +4,6 @@
 import asyncio
 
 import numpy as np
-import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion, TwistStamped
 from moveit_msgs.msg import CollisionObject, AttachedCollisionObject, PlanningScene
 from scipy.spatial.transform import Rotation as R
@@ -166,9 +165,114 @@ class StateOpsMixin:
         if settle_sec is None:
             settle_sec = float(getattr(self, 'cartesian_segment_settle_sec', 0.04))
         settle_sec = max(0.0, float(settle_sec))
+        fraction_threshold = max(
+            0.90, min(0.999, float(getattr(self, 'cartesian_fraction_threshold', 0.98))))
+        one_shot_fraction_threshold = max(
+            fraction_threshold,
+            min(0.999, float(getattr(self, 'cartesian_one_shot_fraction_threshold', 0.985)))
+        )
+        prefer_continuous = bool(getattr(self, 'cartesian_prefer_continuous', True))
+        continuous_min_segments = max(2, int(getattr(self, 'cartesian_continuous_min_segments', 2)))
+
+        def _make_pose(x, y, z, q):
+            ps = PoseStamped().pose
+            ps.position.x = float(x)
+            ps.position.y = float(y)
+            ps.position.z = float(z)
+            ps.orientation = Quaternion(
+                x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
+            return ps
+
+        def _traj_end_sec(traj):
+            points = list(getattr(traj, 'points', []) or [])
+            if not points:
+                return 0.0
+            last = points[-1].time_from_start
+            return float(last.sec) + float(last.nanosec) * 1e-9
+
         self.get_logger().info(
             f"{description}: 分段执行 {seg_count} 段, 单段位移="
             f"({step[0]:.4f},{step[1]:.4f},{step[2]:.4f})m")
+
+        # 连续轨迹优先：多段位移先尝试“一次规划一次执行”，避免分段 stop-go
+        if prefer_continuous and seg_count >= continuous_min_segments:
+            left_p0, left_q0 = await self.get_current_pose('mj_left_link8')
+            right_p0, right_q0 = await self.get_current_pose('mj_right_link8')
+            if left_p0 is not None and right_p0 is not None and left_q0 is not None and right_q0 is not None:
+                left_waypoints = [_make_pose(left_p0[0], left_p0[1], left_p0[2], left_q0)]
+                right_waypoints = [_make_pose(right_p0[0], right_p0[1], right_p0[2], right_q0)]
+                for idx in range(1, seg_count + 1):
+                    delta_i = step * float(idx)
+                    left_waypoints.append(_make_pose(
+                        left_p0[0] + delta_i[0],
+                        left_p0[1] + delta_i[1],
+                        left_p0[2] + delta_i[2],
+                        left_q0,
+                    ))
+                    right_waypoints.append(_make_pose(
+                        right_p0[0] + delta_i[0],
+                        right_p0[1] + delta_i[1],
+                        right_p0[2] + delta_i[2],
+                        right_q0,
+                    ))
+
+                try:
+                    req_l_all = GCP.Request()
+                    req_l_all.group_name = self._group_name('left')
+                    req_l_all.waypoints = left_waypoints
+                    req_l_all.max_step = float(max_step)
+                    req_l_all.jump_threshold = 0.0
+                    req_l_all.avoid_collisions = bool(avoid_collisions)
+                    res_l_all = await asyncio.wait_for(self.cartesian_client.call_async(req_l_all), timeout=12.0)
+
+                    req_r_all = GCP.Request()
+                    req_r_all.group_name = self._group_name('right')
+                    req_r_all.waypoints = right_waypoints
+                    req_r_all.max_step = float(max_step)
+                    req_r_all.jump_threshold = 0.0
+                    req_r_all.avoid_collisions = bool(avoid_collisions)
+                    res_r_all = await asyncio.wait_for(self.cartesian_client.call_async(req_r_all), timeout=12.0)
+
+                    frac_l_all = float(getattr(res_l_all, 'fraction', 0.0))
+                    frac_r_all = float(getattr(res_r_all, 'fraction', 0.0))
+                    left_traj_all = getattr(getattr(res_l_all, 'solution', None), 'joint_trajectory', None)
+                    right_traj_all = getattr(getattr(res_r_all, 'solution', None), 'joint_trajectory', None)
+
+                    valid_one_shot = (
+                        frac_l_all >= one_shot_fraction_threshold and
+                        frac_r_all >= one_shot_fraction_threshold and
+                        left_traj_all is not None and right_traj_all is not None and
+                        len(getattr(left_traj_all, 'points', []) or []) > 0 and
+                        len(getattr(right_traj_all, 'points', []) or []) > 0
+                    )
+                    if valid_one_shot:
+                        base_duration = max(0.1, _traj_end_sec(left_traj_all), _traj_end_sec(right_traj_all))
+                        desired_duration = max(1.0, float(np.linalg.norm(total)) / target_speed)
+                        time_scale = max(1.0, min(10.0, desired_duration / base_duration))
+                        self.get_logger().info(
+                            f"{description}: 连续轨迹一次执行, "
+                            f"frac_l={frac_l_all:.3f}, frac_r={frac_r_all:.3f}, "
+                            f"base={base_duration:.2f}s, desired={desired_duration:.2f}s, "
+                            f"time_scale={time_scale:.2f}")
+                        ok_all = await self._execute_merged_trajectory(
+                            left_traj_all, right_traj_all, time_scale=time_scale)
+                        if ok_all:
+                            if settle_sec > 1e-4:
+                                await asyncio.sleep(settle_sec)
+                            self.get_logger().info(
+                                f"{description}: 连续执行完成, "
+                                f"总位移=({total[0]:.4f},{total[1]:.4f},{total[2]:.4f})m")
+                            return True
+                        self.get_logger().warn(f"{description}: 连续轨迹执行失败，回退分段执行")
+                    else:
+                        self.get_logger().warn(
+                            f"{description}: 连续轨迹质量不足，回退分段执行 "
+                            f"(frac_l={frac_l_all:.3f}, frac_r={frac_r_all:.3f}, "
+                            f"threshold={one_shot_fraction_threshold:.3f})")
+                except Exception as e:
+                    self.get_logger().warn(f"{description}: 连续轨迹规划失败，回退分段执行: {e}")
+            else:
+                self.get_logger().warn(f"{description}: 无法读取起始位姿，跳过连续轨迹尝试")
 
         for seg_idx in range(seg_count):
             left_p, left_q = await self.get_current_pose('mj_left_link8')
@@ -231,21 +335,14 @@ class StateOpsMixin:
             frac_r = float(getattr(res_r, 'fraction', 0.0))
             left_traj = getattr(getattr(res_l, 'solution', None), 'joint_trajectory', None)
             right_traj = getattr(getattr(res_r, 'solution', None), 'joint_trajectory', None)
-            if frac_l < 0.98 or frac_r < 0.98 or left_traj is None or right_traj is None:
+            if frac_l < fraction_threshold or frac_r < fraction_threshold or left_traj is None or right_traj is None:
                 self.get_logger().warn(
                     f"{description}: 轨迹质量不足(segment={seg_idx + 1}/{seg_count}) "
-                    f"frac_l={frac_l:.3f}, frac_r={frac_r:.3f}")
+                    f"frac_l={frac_l:.3f}, frac_r={frac_r:.3f}, "
+                    f"threshold={fraction_threshold:.3f}")
                 return False
 
-            left_last_t = 0.0
-            right_last_t = 0.0
-            if left_traj.points:
-                lp = left_traj.points[-1].time_from_start
-                left_last_t = float(lp.sec) + float(lp.nanosec) * 1e-9
-            if right_traj.points:
-                rp = right_traj.points[-1].time_from_start
-                right_last_t = float(rp.sec) + float(rp.nanosec) * 1e-9
-            base_duration = max(0.1, left_last_t, right_last_t)
+            base_duration = max(0.1, _traj_end_sec(left_traj), _traj_end_sec(right_traj))
             segment_dist = float(np.linalg.norm(step))
             desired_duration = max(0.8, segment_dist / target_speed)
             time_scale = max(1.0, min(8.0, desired_duration / base_duration))
@@ -260,6 +357,109 @@ class StateOpsMixin:
         self.get_logger().info(
             f"{description}: 执行完成, 总位移=({total[0]:.4f},{total[1]:.4f},{total[2]:.4f})m")
         return True
+
+    async def _move_dual_cartesian_to_targets(self, left_goal: PoseStamped, right_goal: PoseStamped,
+                                              description: str = "双臂笛卡尔目标对齐", max_step: float = 0.004,
+                                              target_speed: float = None, avoid_collisions: bool = False) -> bool:
+        """
+        从当前位姿直接笛卡尔插补到左右臂各自目标（非同增量），优先用于预抓取微调，
+        避免 IK 重规划造成的构型跳变和“甩臂”。
+        """
+        if not bool(getattr(self, 'dual_controller_available', False)):
+            self.get_logger().warn(f"{description}: dual_controller 不可用")
+            return False
+        if self.cartesian_client is None or not self.cartesian_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f"{description}: /compute_cartesian_path 服务不可用")
+            return False
+
+        left_p, left_q = await self.get_current_pose('mj_left_link8')
+        right_p, right_q = await self.get_current_pose('mj_right_link8')
+        if left_p is None or right_p is None or left_q is None or right_q is None:
+            self.get_logger().warn(f"{description}: 无法读取当前末端位姿")
+            return False
+
+        if target_speed is None:
+            target_speed = float(getattr(self, 'pregrasp_force_align_speed', 0.010))
+        target_speed = max(0.005, float(target_speed))
+        max_step = max(0.002, float(max_step))
+        fraction_threshold = max(
+            0.90, min(0.999, float(getattr(self, 'cartesian_fraction_threshold', 0.98))))
+
+        from moveit_msgs.srv import GetCartesianPath as GCP
+
+        left_start = PoseStamped().pose
+        left_start.position.x = float(left_p[0])
+        left_start.position.y = float(left_p[1])
+        left_start.position.z = float(left_p[2])
+        left_start.orientation = Quaternion(
+            x=float(left_q[0]), y=float(left_q[1]), z=float(left_q[2]), w=float(left_q[3]))
+
+        right_start = PoseStamped().pose
+        right_start.position.x = float(right_p[0])
+        right_start.position.y = float(right_p[1])
+        right_start.position.z = float(right_p[2])
+        right_start.orientation = Quaternion(
+            x=float(right_q[0]), y=float(right_q[1]), z=float(right_q[2]), w=float(right_q[3]))
+
+        try:
+            req_l = GCP.Request()
+            req_l.group_name = self._group_name('left')
+            req_l.waypoints = [left_start, left_goal.pose]
+            req_l.max_step = float(max_step)
+            req_l.jump_threshold = 0.0
+            req_l.avoid_collisions = bool(avoid_collisions)
+            res_l = await asyncio.wait_for(self.cartesian_client.call_async(req_l), timeout=10.0)
+
+            req_r = GCP.Request()
+            req_r.group_name = self._group_name('right')
+            req_r.waypoints = [right_start, right_goal.pose]
+            req_r.max_step = float(max_step)
+            req_r.jump_threshold = 0.0
+            req_r.avoid_collisions = bool(avoid_collisions)
+            res_r = await asyncio.wait_for(self.cartesian_client.call_async(req_r), timeout=10.0)
+        except Exception as e:
+            self.get_logger().warn(f"{description}: CartesianPath 服务调用失败: {e}")
+            return False
+
+        frac_l = float(getattr(res_l, 'fraction', 0.0))
+        frac_r = float(getattr(res_r, 'fraction', 0.0))
+        left_traj = getattr(getattr(res_l, 'solution', None), 'joint_trajectory', None)
+        right_traj = getattr(getattr(res_r, 'solution', None), 'joint_trajectory', None)
+        if (
+            frac_l < fraction_threshold or frac_r < fraction_threshold or
+            left_traj is None or right_traj is None
+        ):
+            self.get_logger().warn(
+                f"{description}: 轨迹质量不足 frac_l={frac_l:.3f}, frac_r={frac_r:.3f}, "
+                f"threshold={fraction_threshold:.3f}")
+            return False
+
+        def _traj_end_sec(traj):
+            points = list(getattr(traj, 'points', []) or [])
+            if not points:
+                return 0.0
+            last = points[-1].time_from_start
+            return float(last.sec) + float(last.nanosec) * 1e-9
+
+        left_dist = float(np.linalg.norm([
+            float(left_goal.pose.position.x) - float(left_p[0]),
+            float(left_goal.pose.position.y) - float(left_p[1]),
+            float(left_goal.pose.position.z) - float(left_p[2]),
+        ]))
+        right_dist = float(np.linalg.norm([
+            float(right_goal.pose.position.x) - float(right_p[0]),
+            float(right_goal.pose.position.y) - float(right_p[1]),
+            float(right_goal.pose.position.z) - float(right_p[2]),
+        ]))
+        dist = max(left_dist, right_dist)
+        base_duration = max(0.1, _traj_end_sec(left_traj), _traj_end_sec(right_traj))
+        desired_duration = max(0.8, dist / target_speed)
+        time_scale = max(1.0, min(12.0, desired_duration / base_duration))
+
+        self.get_logger().info(
+            f"{description}: 左右位移=({left_dist:.4f},{right_dist:.4f})m, "
+            f"base={base_duration:.2f}s, desired={desired_duration:.2f}s, time_scale={time_scale:.2f}")
+        return await self._execute_merged_trajectory(left_traj, right_traj, time_scale=time_scale)
 
     async def _move_dual_cartesian_delta_z(self, delta_z: float, description: str = "双臂笛卡尔升降",
                                            max_step: float = 0.008, max_segment: float = None,
@@ -852,16 +1052,64 @@ class StateOpsMixin:
                         right_force_align.pose.position.z = float(align_z)
                         right_force_align.pose.orientation = self.grasp_orientation_right
 
-                        force_align_ok = await self.sync_move_arms(
-                            left_force_align,
-                            right_force_align,
-                            pos_tol=float(getattr(self, 'pregrasp_force_align_pos_tol', 0.004)),
-                            ori_tol_x=0.035,
-                            ori_tol_y=0.035,
-                            ori_tol_z=0.05,
-                            max_retries=2,
-                        )
-                        await asyncio.sleep(0.2)
+                        left_move = float(np.linalg.norm([
+                            float(left_force_align.pose.position.x) - float(left_chk[0]),
+                            float(left_force_align.pose.position.y) - float(left_chk[1]),
+                            float(left_force_align.pose.position.z) - float(left_chk[2]),
+                        ]))
+                        right_move = float(np.linalg.norm([
+                            float(right_force_align.pose.position.x) - float(right_chk[0]),
+                            float(right_force_align.pose.position.y) - float(right_chk[1]),
+                            float(right_force_align.pose.position.z) - float(right_chk[2]),
+                        ]))
+                        max_jump = max(0.01, float(getattr(self, 'pregrasp_force_align_max_jump', 0.035)))
+                        if max(left_move, right_move) > max_jump:
+                            if demo_soft_pregrasp_gate:
+                                self.get_logger().warn(
+                                    f"预抓取强制对齐目标位移过大(L={left_move:.4f}, R={right_move:.4f}, "
+                                    f"max={max_jump:.4f})，为避免甩臂，demo模式跳过该步")
+                                force_align_ok = True
+                            else:
+                                self.get_logger().error(
+                                    f"预抓取强制对齐位移过大(L={left_move:.4f}, R={right_move:.4f}, max={max_jump:.4f})")
+                                self.current_state = TaskState.ERROR
+                                return
+                        else:
+                            force_align_ok = False
+                            use_cartesian_align = bool(getattr(self, 'pregrasp_force_align_use_cartesian', True))
+                            if use_cartesian_align:
+                                force_align_ok = await self._move_dual_cartesian_to_targets(
+                                    left_force_align,
+                                    right_force_align,
+                                    description="预抓取强制对齐(双臂笛卡尔)",
+                                    max_step=0.004,
+                                    target_speed=float(getattr(self, 'pregrasp_force_align_speed', 0.010)),
+                                    avoid_collisions=False,
+                                )
+                                if force_align_ok:
+                                    self.get_logger().info("预抓取强制对齐已通过笛卡尔微调完成（连续性优先）")
+
+                            if not force_align_ok:
+                                # 回退到 Joint-space 同步规划时，临时提升“贴近当前关节”权重，抑制构型跳变甩臂
+                                orig_delta_w = float(getattr(self, 'natural_ik_current_delta_weight', 0.06))
+                                boost_w = max(orig_delta_w, float(
+                                    getattr(self, 'pregrasp_force_align_current_delta_boost', 0.24)))
+                                self.natural_ik_current_delta_weight = boost_w
+                                try:
+                                    force_align_ok = await self.sync_move_arms(
+                                        left_force_align,
+                                        right_force_align,
+                                        pos_tol=float(getattr(self, 'pregrasp_force_align_pos_tol', 0.004)),
+                                        ori_tol_x=0.05,
+                                        ori_tol_y=0.05,
+                                        ori_tol_z=0.08,
+                                        max_retries=1,
+                                    )
+                                finally:
+                                    self.natural_ik_current_delta_weight = orig_delta_w
+
+                        await asyncio.sleep(max(
+                            0.0, float(getattr(self, 'pregrasp_force_align_settle_sec', 0.08))))
 
                         left_chk2, _ = await self.get_current_pose('mj_left_link8')
                         right_chk2, _ = await self.get_current_pose('mj_right_link8')
@@ -1160,13 +1408,14 @@ class StateOpsMixin:
         start_time = self.get_clock().now().nanoseconds * 1e-9
         width = max_width
         success = False
+        step_dwell = max(0.02, float(getattr(self, 'grasp_close_step_dwell_sec', 0.10)))
         block_confirm_steps = max(1, int(getattr(self, 'grasp_block_confirm_steps', 2)))
         block_counter = 0
         while width > target_width + 1e-6:
             # 每一步收紧
             width = max(target_width, width - step)
             await self.sync_grasp(width, effort, wait_for_result=True)
-            await asyncio.sleep(0.10)
+            await asyncio.sleep(step_dwell)
 
             # 读取力反馈判断是否接触
             left_fy = abs(self.current_left_wrench.wrench.force.y - self.left_force_bias['y'])
@@ -1303,7 +1552,8 @@ class StateOpsMixin:
         # === 夹爪参数设定 ===
         # 针对“夹起失败”场景，收紧目标改得更激进，确保产生有效挤压
         # 过小目标宽度会在高夹持力下导致“过挤压滑脱/弹飞”，采用更贴近工件厚度的保压宽度
-        GRASP_POSITION = max(0.012, min(float(self.gripper_closed_position), 0.020))
+        grasp_target_min = max(0.0, float(getattr(self, 'grasp_target_min_width', 0.012)))
+        GRASP_POSITION = min(0.020, max(grasp_target_min, float(self.gripper_closed_position)))
         # 夹爪最大力：对轻质铝条用 170N (最大值)
         GRASP_EFFORT = self.gripper_effort_close
         CONTACT_THRESHOLD = float(getattr(self, 'grasp_contact_threshold', 0.8))
@@ -1329,7 +1579,7 @@ class StateOpsMixin:
                 f"直夹模式启用：目标总开度={total_width:.3f}m（单指={target_single:.3f}m），执行后将校验夹持证据")
 
             await self.sync_grasp(target_single, GRASP_EFFORT, wait_for_result=True)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_direct_check_settle_sec', 0.4))))
 
             left_opening = self.get_gripper_opening_estimate('left')
             right_opening = self.get_gripper_opening_estimate('right')
@@ -1351,13 +1601,14 @@ class StateOpsMixin:
                     hold_min_w = max(0.0, float(getattr(self, 'grasp_hold_width_min', 0.008)))
                     hold_max_w = max(hold_min_w, float(getattr(self, 'grasp_hold_width_max', 0.014)))
                     measured_min = None
+                    tighten_margin = max(0.0005, float(getattr(self, 'grasp_hold_tighten_margin', 0.0035)))
                     if left_opening is not None and right_opening is not None:
-                        measured_min = max(0.0, min(left_opening, right_opening) - 0.002)
+                        measured_min = max(0.0, min(left_opening, right_opening) - tighten_margin)
                     hold_seed = target_single if measured_min is None else measured_min
                     hold_width = max(hold_min_w, min(hold_seed, hold_max_w))
                     self.get_logger().info(
-                        f"[保压宽度-直夹] measured_min={measured_min}, use={hold_width:.4f}, "
-                        f"range=[{hold_min_w:.4f},{hold_max_w:.4f}]")
+                        f"[保压宽度-直夹] measured_min={measured_min}, tighten_margin={tighten_margin:.4f}, "
+                        f"use={hold_width:.4f}, range=[{hold_min_w:.4f},{hold_max_w:.4f}]")
                     await self.start_gripper_hold(width=hold_width, effort=GRASP_EFFORT)
                 except Exception as e:
                     self.get_logger().warn(f"启动夹爪保压循环失败: {e}")
@@ -1390,7 +1641,9 @@ class StateOpsMixin:
                 return
 
         # 在闭合前进行力传感器去皮校准，以获得可靠的接触判定基线
-        await self.calibrate_force_sensors(duration_sec=0.5)
+        await self.calibrate_force_sensors(
+            duration_sec=max(0.1, float(getattr(self, 'grasp_force_calibration_sec', 0.5)))
+        )
 
         # 夹取前微下压：给指尖建立接触预载，减少“只碰不夹”概率
         preload_down = self._adaptive_grasp_downward(
@@ -1406,12 +1659,12 @@ class StateOpsMixin:
                 delta_z=-preload_down, description="夹取预载下压")
             if not ok_preload:
                 await self.servo_move_delta_z(delta_z=-preload_down, duration=max(0.6, preload_down / 0.02))
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_preload_settle_sec', 0.2))))
 
         # 使用受力驱动的逐步夹紧（从大到小），优先使用带反馈的逐步收紧策略
         grasp_ok = await self.controlled_grasp_close(target_width=GRASP_POSITION,
                                                      max_width=self.gripper_open_position,
-                                                     step=0.0025,
+                                                     step=float(getattr(self, 'grasp_close_step_main', 0.0055)),
                                                      effort=GRASP_EFFORT,
                                                      contact_threshold=CONTACT_THRESHOLD,
                                                      timeout=8.0,
@@ -1432,10 +1685,10 @@ class StateOpsMixin:
                     delta_z=-retry_down, description="二次夹取预载下压")
                 if not ok_retry_preload:
                     await self.servo_move_delta_z(delta_z=-retry_down, duration=max(0.6, retry_down / 0.02))
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_retry_settle_sec', 0.2))))
             grasp_ok = await self.controlled_grasp_close(target_width=0.0,
                                                          max_width=self.gripper_open_position,
-                                                         step=0.002,
+                                                         step=float(getattr(self, 'grasp_close_step_retry', 0.0040)),
                                                          effort=GRASP_EFFORT,
                                                          contact_threshold=max(0.3, CONTACT_THRESHOLD * 0.5),
                                                          timeout=6.0,
@@ -1446,10 +1699,23 @@ class StateOpsMixin:
 
             # 确保夹爪以最终目标宽度锁定以增加稳定性，并等待物理稳定
             try:
-                await self.sync_grasp(GRASP_POSITION, GRASP_EFFORT)
+                left_lock_open = self.get_gripper_opening_estimate('left')
+                right_lock_open = self.get_gripper_opening_estimate('right')
+                lock_tighten_margin = max(0.0, float(getattr(self, 'grasp_lock_tighten_margin', 0.0008)))
+                lock_width = GRASP_POSITION
+                if left_lock_open is not None and right_lock_open is not None:
+                    lock_width = self._clamp_gripper_position(
+                        max(GRASP_POSITION, min(left_lock_open, right_lock_open) - lock_tighten_margin)
+                    )
+                self.get_logger().info(
+                    f"[夹爪锁定] base={GRASP_POSITION:.4f}, "
+                    f"measured_l={left_lock_open}, measured_r={right_lock_open}, "
+                    f"tighten_margin={lock_tighten_margin:.4f}, use={lock_width:.4f}"
+                )
+                await self.sync_grasp(lock_width, GRASP_EFFORT)
             except Exception:
                 pass
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_post_sync_settle_sec', 0.6))))
 
             # 夹持证据复核：若最终几乎闭死，通常是空抓，触发一次额外下压重试
             left_hold = self.get_gripper_opening_estimate('left')
@@ -1473,9 +1739,9 @@ class StateOpsMixin:
                         delta_z=-retry_down, description="空抓复核下压")
                     if not ok_regrasp_preload:
                         await self.servo_move_delta_z(delta_z=-retry_down, duration=max(0.6, retry_down / 0.02))
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_retry_settle_sec', 0.2))))
                 await self.sync_grasp(0.0, GRASP_EFFORT)
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_empty_recheck_settle_sec', 0.4))))
 
             preload_lift = max(0.0, float(getattr(self, 'grasp_preload_lift', 0.015)))
             if preload_lift > 1e-6:
@@ -1484,7 +1750,7 @@ class StateOpsMixin:
                     delta_z=preload_lift, description="夹后预载抬升")
                 if not ok_post_lift:
                     await self.servo_move_delta_z(delta_z=preload_lift, duration=max(0.8, preload_lift / 0.02))
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_post_lift_settle_sec', 0.2))))
 
             # 进入搬运前启动持续保压，降低提举阶段松脱概率
             try:
@@ -1493,13 +1759,14 @@ class StateOpsMixin:
                 hold_left = self.get_gripper_opening_estimate('left')
                 hold_right = self.get_gripper_opening_estimate('right')
                 measured_min = None
+                tighten_margin = max(0.0005, float(getattr(self, 'grasp_hold_tighten_margin', 0.0035)))
                 if hold_left is not None and hold_right is not None:
-                    measured_min = max(0.0, min(hold_left, hold_right) - 0.002)
+                    measured_min = max(0.0, min(hold_left, hold_right) - tighten_margin)
                 hold_seed = GRASP_POSITION if measured_min is None else measured_min
                 hold_width = max(hold_min_w, min(hold_seed, hold_max_w))
                 self.get_logger().info(
-                    f"[保压宽度-受力夹取] measured_min={measured_min}, use={hold_width:.4f}, "
-                    f"range=[{hold_min_w:.4f},{hold_max_w:.4f}]")
+                    f"[保压宽度-受力夹取] measured_min={measured_min}, tighten_margin={tighten_margin:.4f}, "
+                    f"use={hold_width:.4f}, range=[{hold_min_w:.4f},{hold_max_w:.4f}]")
                 await self.start_gripper_hold(width=hold_width, effort=GRASP_EFFORT)
             except Exception as e:
                 self.get_logger().warn(f"启动夹爪保压循环失败: {e}")
@@ -1534,7 +1801,7 @@ class StateOpsMixin:
             # 兜底：当受力驱动未能检测到接触时，尝试一次固定位置闭合并基于位置判定
             self.get_logger().warn("受力驱动夹取未成功，尝试一次固定位置闭合作为兜底")
             await self.sync_grasp(0.0, GRASP_EFFORT)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(max(0.0, float(getattr(self, 'grasp_fallback_settle_sec', 1.0))))
             left_contact_force = abs(self.current_left_wrench.wrench.force.y - self.left_force_bias.get('y', 0.0))
             right_contact_force = abs(self.current_right_wrench.wrench.force.y - self.right_force_bias.get('y', 0.0))
             left_opening = self.get_gripper_opening_estimate('left')
@@ -1595,7 +1862,7 @@ class StateOpsMixin:
                     self.get_logger().warn("State5 快照回放失败，最后尝试 IK 抬升")
                     await self._dual_delta_z_fallback(delta_z=delta_z, description="State5 IK兜底")
         
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(max(0.0, float(getattr(self, 'state_transition_pause_sec', 0.08))))
         
         # 构建一个虚拟的笛卡尔轨迹（用于兼容后续执行逻辑）
         # 实际State 6会使用伺服而不是这个轨迹
@@ -1615,13 +1882,13 @@ class StateOpsMixin:
         
         # 执行搬运：做小幅补偿抬升，避免与 State 5 重复大幅上抬造成闭链应力峰值
         current_ee_z = await self._estimate_dual_ee_z()
-        target_transport_z = float(self.LIFT_HEIGHT + 0.05)
+        target_transport_z = float(self.LIFT_HEIGHT + float(getattr(self, 'transport_lift_extra', 0.0)))
         if current_ee_z is None:
-            delta_z = 0.05
+            delta_z = max(0.0, float(getattr(self, 'transport_lift_extra', 0.0)))
         else:
             delta_z = max(0.0, min(0.12, target_transport_z - current_ee_z))
 
-        if delta_z > 0.01:
+        if delta_z > 0.008:
             duration = max(2.0, min(4.0, delta_z / 0.04))
             self.get_logger().info(
                 f"开始搬运补偿抬升: current_z={current_ee_z}, target={target_transport_z:.3f}, delta={delta_z:.3f}")
@@ -1695,13 +1962,14 @@ class StateOpsMixin:
         else:
             self.get_logger().warn("TRANSPORT 偏移量接近 0，跳过主搬运平移")
         
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(max(0.0, float(getattr(self, 'state_transition_pause_sec', 0.08))))
         self.get_logger().info("✓ 搬运动作执行完成，进入开爪放置阶段")
         self.current_state = TaskState.OPEN_GRIPPERS
 
     async def state_open_grippers(self):
         """State 7: 到达放置点，解除闭合与附着（detach），开启夹爪"""
         self.get_logger().info(">> State 7: open_grippers() - 下放物体并 detach 分离...")
+        force_continue = bool(self._is_force_continue_enabled())
         try:
             await self.stop_gripper_hold("进入放置阶段，准备开爪")
         except Exception:
@@ -1719,6 +1987,7 @@ class StateOpsMixin:
         target_tol = max(0.002, float(getattr(self, 'place_release_target_tol', 0.006)))
         max_iters = max(1, int(getattr(self, 'place_release_max_iters', 3)))
         min_total_down = max(0.01, float(getattr(self, 'place_release_min_total_down', 0.06)))
+        commanded_total_down = 0.0
 
         self.get_logger().info(
             f"放置缓降目标: start_z={current_ee_z}, target_z={target_release_ee_z:.3f}, "
@@ -1742,6 +2011,7 @@ class StateOpsMixin:
             self.get_logger().info(
                 f"放置缓降[{attempt}/{max_iters}] current_z={current_ee_z}, "
                 f"target_z={target_release_ee_z:.4f}, delta={step_delta:.4f}, duration={step_duration:.2f}s")
+            commanded_total_down += abs(float(step_delta))
 
             step_ok = await self._move_dual_cartesian_delta_z(
                 delta_z=step_delta,
@@ -1751,7 +2021,7 @@ class StateOpsMixin:
                 self.get_logger().warn("放置笛卡尔步进失败，回退伺服步进")
                 await self.servo_move_delta_z(step_delta, duration=step_duration)
 
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(max(0.0, float(getattr(self, 'place_release_step_pause_sec', 0.08))))
             z_next = await self._estimate_dual_ee_z()
             if current_ee_z is not None and z_next is not None:
                 moved = float(current_ee_z - z_next)
@@ -1763,23 +2033,39 @@ class StateOpsMixin:
         # 放置高度到位验收：不到位则禁止开爪，避免高空掉落
         if current_ee_z is not None:
             if current_ee_z > target_release_ee_z + target_tol:
-                self.get_logger().error(
-                    f"放置高度仍未达标: current_z={current_ee_z:.4f}, "
-                    f"target_z<={target_release_ee_z + target_tol:.4f}，保持夹持并进入 ERROR")
-                self.current_state = TaskState.ERROR
-                return
+                overshoot = float(current_ee_z - target_release_ee_z)
+                relax_margin = max(target_tol * 2.0, 0.015)
+                if force_continue and overshoot <= relax_margin and commanded_total_down >= min_total_down * 0.7:
+                    self.get_logger().warn(
+                        f"放置高度略高于目标(overshoot={overshoot:.4f}m)，"
+                        f"demo容错继续开爪: commanded_down={commanded_total_down:.4f}m")
+                else:
+                    self.get_logger().error(
+                        f"放置高度仍未达标: current_z={current_ee_z:.4f}, "
+                        f"target_z<={target_release_ee_z + target_tol:.4f}，保持夹持并进入 ERROR")
+                    self.current_state = TaskState.ERROR
+                    return
             if z_start is not None:
                 total_down = float(z_start - current_ee_z)
                 if total_down < min_total_down:
-                    self.get_logger().error(
-                        f"放置总下放不足: total_down={total_down:.4f} < min_required={min_total_down:.4f}，"
-                        f"保持夹持并进入 ERROR")
-                    self.current_state = TaskState.ERROR
-                    return
+                    if force_continue and commanded_total_down >= min_total_down:
+                        self.get_logger().warn(
+                            f"TF估计下放不足(total_down={total_down:.4f})，"
+                            f"按命令累计下放(commanded_down={commanded_total_down:.4f})继续开爪")
+                    else:
+                        self.get_logger().error(
+                            f"放置总下放不足: total_down={total_down:.4f} < min_required={min_total_down:.4f}，"
+                            f"保持夹持并进入 ERROR")
+                        self.current_state = TaskState.ERROR
+                        return
         else:
-            self.get_logger().error("放置阶段无法验收末端高度，禁止开爪并进入 ERROR")
-            self.current_state = TaskState.ERROR
-            return
+            if force_continue and commanded_total_down >= min_total_down:
+                self.get_logger().warn(
+                    "放置阶段无法验收末端高度，demo容错依据命令累计下放通过并继续开爪")
+            else:
+                self.get_logger().error("放置阶段无法验收末端高度，禁止开爪并进入 ERROR")
+                self.current_state = TaskState.ERROR
+                return
         
         self.get_logger().info("解除夹持目标，打开双臂夹爪...")
         await self.ensure_grippers_open()
@@ -1906,8 +2192,3 @@ class StateOpsMixin:
             self.current_state = TaskState.FINISHED
         else:
             self.current_state = TaskState.ERROR
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = DualArmTaskNode()

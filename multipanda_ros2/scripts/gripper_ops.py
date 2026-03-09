@@ -183,12 +183,52 @@ class GripperOpsMixin:
             return False
 
     async def _gripper_hold_loop(self):
-        interval = max(0.15, float(getattr(self, 'gripper_hold_interval_sec', 0.35)))
+        interval = max(0.10, float(getattr(self, 'gripper_hold_interval_sec', 0.18)))
+        opening_tol = max(0.0003, float(getattr(self, 'gripper_hold_opening_tolerance', 0.0010)))
+        refresh_sec = max(interval, float(getattr(self, 'gripper_hold_refresh_sec', 0.35)))
+        close_bias = max(0.0, float(getattr(self, 'gripper_hold_close_bias', 0.0008)))
+        loop = asyncio.get_running_loop()
+        last_cmd_ts = 0.0
+        force_refresh = True
+
         while bool(getattr(self, '_gripper_hold_active', False)):
             width = float(getattr(self, '_gripper_hold_width', self.gripper_closed_position))
             effort = float(getattr(self, '_gripper_hold_effort', self.gripper_effort_close))
+            close_target = self._clamp_gripper_position(max(0.0, width - close_bias))
+            now = loop.time()
+
+            left_open = self.get_gripper_opening_estimate('left')
+            right_open = self.get_gripper_opening_estimate('right')
+            # 关键：保压只做“防滑补夹紧”，不做“反向张开”，避免夹爪来回抖动导致掉条
+            slip_left = (left_open is not None and left_open > width + opening_tol)
+            slip_right = (right_open is not None and right_open > width + opening_tol)
+            has_opening_feedback = (left_open is not None or right_open is not None)
+            periodic_refresh = (
+                (now - last_cmd_ts) >= refresh_sec and
+                (not has_opening_feedback)
+            )
+
             try:
-                await self.sync_grasp(width, effort, wait_for_result=False)
+                if slip_left:
+                    await self.control_gripper_async(
+                        'left', close_target, effort, wait_for_result=False, quiet=True)
+                    last_cmd_ts = now
+                    force_refresh = False
+                if slip_right:
+                    await self.control_gripper_async(
+                        'right', close_target, effort, wait_for_result=False, quiet=True)
+                    last_cmd_ts = now
+                    force_refresh = False
+
+                if force_refresh and not (slip_left or slip_right):
+                    # 启动初次保压时打一枪闭环指令（依然采用更保守的 close_target）
+                    await self.sync_grasp(close_target, effort, wait_for_result=False, quiet=True)
+                    last_cmd_ts = now
+                    force_refresh = False
+                elif periodic_refresh:
+                    # 没有可靠开度反馈时，低频刷新兜底
+                    await self.sync_grasp(close_target, effort, wait_for_result=False, quiet=True)
+                    last_cmd_ts = now
             except Exception as e:
                 self._gripper_warn_once('hold_loop_error', f"夹爪保压循环异常: {e}")
             await asyncio.sleep(interval)
@@ -266,12 +306,12 @@ class GripperOpsMixin:
             return False
 
     async def control_gripper_async(self, side: str, position: float, max_effort: float,
-                                     wait_for_result: bool = True):
+                                     wait_for_result: bool = True, quiet: bool = False):
         client = self.left_gripper_client if side == 'left' else self.right_gripper_client
         goal = GripperCommand.Goal()
         requested_position = float(position)
         clamped_position = self._clamp_gripper_position(requested_position)
-        if abs(clamped_position - requested_position) > 1e-6:
+        if not quiet and abs(clamped_position - requested_position) > 1e-6:
             self.get_logger().warn(
                 f"{side}夹爪目标超范围: req={requested_position:.3f}m -> clamp={clamped_position:.3f}m")
         goal.command.position = clamped_position
@@ -279,7 +319,8 @@ class GripperOpsMixin:
         
         open_threshold = 0.8 * float(self.gripper_open_position)
         action_desc = "闭合" if clamped_position < open_threshold else "张开"
-        self.get_logger().info(f"夹爪{action_desc} {side}: pos={clamped_position:.3f}m, effort={max_effort:.0f}N")
+        if not quiet:
+            self.get_logger().info(f"夹爪{action_desc} {side}: pos={clamped_position:.3f}m, effort={max_effort:.0f}N")
         command_ok = False
         try:
             goal_handle = await asyncio.wait_for(
@@ -311,9 +352,10 @@ class GripperOpsMixin:
                         source='gripper_action',
                     )
                     if result.status == GoalStatus.STATUS_SUCCEEDED:
-                        self.get_logger().info(
-                            f"{side}夹爪{action_desc}完成(状态={result.status}, "
-                            f"opening={normalized_pos})")
+                        if not quiet:
+                            self.get_logger().info(
+                                f"{side}夹爪{action_desc}完成(状态={result.status}, "
+                                f"opening={normalized_pos})")
                         command_ok = True
                     elif result.status == GoalStatus.STATUS_ABORTED:
                         cur_opening = self.get_gripper_opening_estimate(side)
@@ -353,16 +395,18 @@ class GripperOpsMixin:
             wait_for_result=wait_for_result,
         )
         if move_ok:
-            self.get_logger().info(f"{side}夹爪通过 Move 兜底通道执行成功")
+            if not quiet:
+                self.get_logger().info(f"{side}夹爪通过 Move 兜底通道执行成功")
             return True
         return False
 
-    async def sync_grasp(self, width: float, effort: float, wait_for_result: bool = True):
+    async def sync_grasp(self, width: float, effort: float, wait_for_result: bool = True,
+                         quiet: bool = False):
         """同步控制双爪"""
         width = self._clamp_gripper_position(width)
         left_ok, right_ok = await asyncio.gather(
-            self.control_gripper_async('left', width, effort, wait_for_result),
-            self.control_gripper_async('right', width, effort, wait_for_result)
+            self.control_gripper_async('left', width, effort, wait_for_result, quiet=quiet),
+            self.control_gripper_async('right', width, effort, wait_for_result, quiet=quiet)
         )
         if left_ok and right_ok:
             return True

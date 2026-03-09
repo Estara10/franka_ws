@@ -18,7 +18,6 @@ from control_msgs.action import GripperCommand, FollowJointTrajectory
 from controller_manager_msgs.srv import SwitchController, ListControllers
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import PoseStamped, Quaternion, WrenchStamped, TwistStamped
 from action_msgs.msg import GoalStatus
@@ -118,13 +117,8 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         # 针对双臂分别建立 Servo 控制接口
         self.servo_pub_left = self.create_publisher(TwistStamped, '/servo_node_left/delta_twist_cmds', 10)
         self.servo_pub_right = self.create_publisher(TwistStamped, '/servo_node_right/delta_twist_cmds', 10)
-        self.dual_joint_vel_pub = self.create_publisher(
-            Float64MultiArray, '/dual_joint_group_velocity_controller/commands', 10
-        )
         
         self.current_joint_state = {}
-        self.current_joint_velocity = {}
-        self._last_joint_state_stamp_sec = None
         # 赋予初始全0状态防报错
         self.current_left_wrench = WrenchStamped()
         self.current_right_wrench = WrenchStamped()
@@ -174,12 +168,10 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.all_arm_joints = self.left_arm_joints + self.right_arm_joints
         self.dual_controller_available = False
         self.trajectory_controller_name = 'dual_panda_arm_controller'
-        self.dual_joint_velocity_controller_name = 'dual_joint_group_velocity_controller'
         self.servo_controller_candidates = [
             'servo_controller',
             'dual_servo_controller',
             'dual_panda_servo_controller',
-            'dual_joint_group_velocity_controller',
             'left_arm_velocity_controller',
             'right_arm_velocity_controller',
         ]
@@ -254,24 +246,24 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.transport_task_mode = 'translate'
         self.transport_rotate_deg = 90.0
         self.transport_rotate_direction = 'ccw'  # 'ccw' or 'cw'
-        self.transport_rotate_step_deg = 3.0
+        self.transport_rotate_step_deg = 5.0
         # 旋转任务默认携带姿态旋转，避免“斜夹硬转”
         self.transport_rotate_with_orientation = True
-        self.transport_rotate_pos_tol = 0.015
-        self.transport_rotate_ori_tol = 0.14
-        self.transport_rotate_settle_sec = 0.02
+        self.transport_rotate_pos_tol = 0.018
+        self.transport_rotate_ori_tol = 0.18
+        self.transport_rotate_settle_sec = 0.01
         # 旋转任务执行策略：笛卡尔优先，失败再回退 IK 规划
         self.transport_rotate_cartesian_first = True
-        self.transport_rotate_cartesian_max_step = 0.004
-        self.transport_rotate_speed = 0.006
-        self.transport_rotate_cartesian_fraction_threshold = 0.94
-        # 默认不自动退化为“只转位置”，以保证夹爪始终跟随铝条姿态
-        self.transport_rotate_try_without_orientation = False
-        self.transport_rotate_avoid_collisions = True
-        self.transport_rotate_ik_collision_fallback = False
-        # 默认先走双臂笛卡尔微步，顺序 IK 仅作为可选回退，避免“第一步就 IK 不可达”
+        self.transport_rotate_cartesian_max_step = 0.005
+        self.transport_rotate_speed = 0.012
+        self.transport_rotate_cartesian_fraction_threshold = 0.92
+        # 允许在必要时退化为“只转位置”，提升 90°任务可达率
+        self.transport_rotate_try_without_orientation = True
+        self.transport_rotate_avoid_collisions = False
+        self.transport_rotate_ik_collision_fallback = True
+        # 默认先走双臂笛卡尔微步，顺序 IK 仅作为可选回退
         self.transport_rotate_sequential_mode = False
-        self.transport_rotate_sequential_pause_sec = 0.02
+        self.transport_rotate_sequential_pause_sec = 0.01
         # 连续轨迹执行优先：多段位移先尝试“单次笛卡尔路径+一次执行”，失败再回退分段
         self.cartesian_prefer_continuous = True
         self.cartesian_continuous_min_segments = 2
@@ -290,43 +282,6 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.dual_traj_lead_in_min_sec = 0.25      # s
         self.dual_traj_lead_in_max_sec = 0.90      # s
         self.dual_traj_mid_blend_ratio = 0.45      # 两段式引入中点比例
-        # 串级 PID（关节外环位置 + 内环速度）参数：每关节独立增益
-        self.use_cascade_joint_pid = True
-        self.cascade_pid_auto_switch_controllers = True
-        self.cascade_pid_loop_hz = 120.0
-        self.cascade_pid_outer_kp = [
-            4.2, 4.2, 4.2, 4.0, 3.2, 3.0, 2.6,
-            4.2, 4.2, 4.2, 4.0, 3.2, 3.0, 2.6,
-        ]
-        self.cascade_pid_outer_ki = [
-            0.06, 0.06, 0.06, 0.05, 0.04, 0.04, 0.03,
-            0.06, 0.06, 0.06, 0.05, 0.04, 0.04, 0.03,
-        ]
-        self.cascade_pid_outer_kd = [
-            0.11, 0.11, 0.11, 0.09, 0.07, 0.07, 0.05,
-            0.11, 0.11, 0.11, 0.09, 0.07, 0.07, 0.05,
-        ]
-        self.cascade_pid_inner_kp = [
-            0.85, 0.85, 0.85, 0.80, 0.65, 0.60, 0.50,
-            0.85, 0.85, 0.85, 0.80, 0.65, 0.60, 0.50,
-        ]
-        self.cascade_pid_inner_ki = [
-            0.12, 0.12, 0.12, 0.10, 0.08, 0.08, 0.06,
-            0.12, 0.12, 0.12, 0.10, 0.08, 0.08, 0.06,
-        ]
-        self.cascade_pid_inner_kd = [
-            0.020, 0.020, 0.020, 0.018, 0.015, 0.015, 0.012,
-            0.020, 0.020, 0.020, 0.018, 0.015, 0.015, 0.012,
-        ]
-        self.cascade_pid_outer_i_clamp = 0.20      # rad*s
-        self.cascade_pid_inner_i_clamp = 0.35      # (rad/s)*s
-        self.cascade_pid_outer_v_limit = 0.70      # rad/s
-        self.cascade_pid_cmd_max_vel = 0.85        # rad/s
-        self.cascade_pid_cmd_max_acc = 2.20        # rad/s^2
-        self.cascade_pid_finish_pos_tol = 0.008    # rad
-        self.cascade_pid_finish_vel_tol = 0.050    # rad/s
-        self.cascade_pid_finish_hold_sec = 0.12    # s
-        self.cascade_pid_timeout_pad_sec = 2.0     # s
         self.moveit_joint_vel_scale = 0.20
         self.moveit_joint_acc_scale = 0.12
         self.sync_plan_vel_scale = 0.20
@@ -342,7 +297,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.compliance_force_y_threshold = 28.0
         self.compliance_force_gain = 0.70
         self.compliance_lpf_alpha = 0.96
-        self.compliance_max_v_z = 0.042
+        self.compliance_max_v_z = 0.014
         self.compliance_max_v_y = 0.012
         self.compliance_force_lpf_alpha = 0.88
         self.compliance_force_deadband_ratio = 0.20
@@ -358,7 +313,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.place_release_target_tol = 0.006      # m, 放置高度到位容差
         self.place_release_max_iters = 4           # 放置阶段最多步进次数
         self.place_release_step_pause_sec = 0.08   # 放置分步间停顿（过长会产生明显“停-走”）
-        self.place_release_min_total_down = 0.06   # m, 最小累计下放距离
+        self.place_release_min_total_down = 0.08   # m, 最小累计下放距离
         self.place_descent_verify_min_abs = 0.008  # m, 放置阶段位移验收最小绝对值
         self.place_descent_verify_ratio = 0.35     # 放置阶段位移验收比例阈值
         self.place_descent_retry_max = 0.06        # m, 放置阶段二次兜底最大位移
@@ -377,9 +332,9 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.gripper_effort_close = 170.0
         # 仿真夹爪的 force 参数几乎不生效，保压主要依赖持续位置命令刷新
         self.gripper_hold_interval_sec = 0.24
-        self.gripper_hold_opening_tolerance = 0.0018
-        self.gripper_hold_refresh_sec = 0.55
-        self.gripper_hold_close_bias = 0.0002
+        self.gripper_hold_opening_tolerance = 0.0020
+        self.gripper_hold_refresh_sec = 0.50
+        self.gripper_hold_close_bias = 0.0
         # 夹取策略：默认采用受力驱动逐步夹紧；直夹仅作为显式启用的兜底模式
         self.use_direct_grasp_close = False
         self.direct_grasp_total_width = 0.036  # m, 两指总开度（直夹兜底时使用）
@@ -398,25 +353,14 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.grasp_retry_empty_boost = 0.0040
         self.grasp_retry_contact_reduce = 0.0015
         self.grasp_preload_lift = 0.015
-        self.grasp_target_min_width = 0.014
-        self.grasp_hold_width_min = 0.010
-        self.grasp_hold_width_max = 0.020
-        self.grasp_hold_tighten_margin = 0.0010
+        self.grasp_hold_width_min = 0.006
+        self.grasp_hold_width_max = 0.012
+        self.grasp_hold_tighten_margin = 0.0035
         self.grasp_object_opening_min = 0.012
         self.grasp_block_confirm_steps = 2
         self.grasp_block_margin = 0.003
-        self.grasp_close_step_main = 0.0065
-        self.grasp_close_step_retry = 0.0050
-        self.grasp_force_calibration_sec = 0.28
-        self.grasp_close_step_dwell_sec = 0.06
-        self.grasp_preload_settle_sec = 0.10
-        self.grasp_retry_settle_sec = 0.10
-        self.grasp_post_sync_settle_sec = 0.22
-        self.grasp_empty_recheck_settle_sec = 0.25
-        self.grasp_post_lift_settle_sec = 0.08
-        self.grasp_direct_check_settle_sec = 0.20
-        self.grasp_fallback_settle_sec = 0.35
-        self.grasp_lock_tighten_margin = 0.0008
+        self.grasp_close_step_main = 0.0055
+        self.grasp_close_step_retry = 0.0040
         # 下探安全偏置，减少“手掌先碰铝条”
         self.grasp_z_safety_bias = 0.008
         # 在当前抓取基线上额外下探 2cm（根据实测“下降不够”问题）
@@ -440,15 +384,10 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            append_mode = str(os.environ.get('DUAL_ARM_RUNTIME_LOG_APPEND', '')).strip().lower() in (
-                '1', 'true', 'yes', 'on'
-            )
-            open_mode = 'a' if append_mode else 'w'
-            self._runtime_log_fp = open(log_path, open_mode, encoding='utf-8', buffering=1)
+            self._runtime_log_fp = open(log_path, 'a', encoding='utf-8', buffering=1)
             self._runtime_log_path = str(log_path)
             self._mirrored_logger = _MirroredLogger(self._base_logger, self._append_runtime_log_line)
-            mode_desc = "追加模式(保留历史)" if append_mode else "覆盖模式(启动清空历史)"
-            self._base_logger.info(f"运行日志镜像文件: {self._runtime_log_path} [{mode_desc}]")
+            self._base_logger.info(f"运行日志镜像文件: {self._runtime_log_path}")
             self._append_runtime_log_line('INFO', f"==== 任务进程启动 (pid={os.getpid()}) ====")
         except Exception as e:
             self._runtime_log_fp = None
@@ -490,27 +429,9 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
 
     def _joint_state_cb(self, msg):
-        stamp_sec = float(self.get_clock().now().nanoseconds) * 1e-9
-        try:
-            stamp_sec_msg = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
-            if stamp_sec_msg > 1e-6:
-                stamp_sec = stamp_sec_msg
-        except Exception:
-            pass
-        prev_stamp = getattr(self, '_last_joint_state_stamp_sec', None)
-        dt = None if prev_stamp is None else max(1e-4, float(stamp_sec) - float(prev_stamp))
-
         for i, name in enumerate(msg.name):
-            prev_pos = self.current_joint_state.get(name, None)
             if i < len(msg.position):
                 self.current_joint_state[name] = msg.position[i]
-            if i < len(msg.velocity):
-                self.current_joint_velocity[name] = msg.velocity[i]
-            elif prev_pos is not None and dt is not None and i < len(msg.position):
-                self.current_joint_velocity[name] = (float(msg.position[i]) - float(prev_pos)) / dt
-            elif name not in self.current_joint_velocity:
-                self.current_joint_velocity[name] = 0.0
-        self._last_joint_state_stamp_sec = stamp_sec
 
     def _left_force_cb(self, msg: WrenchStamped):
         self.current_left_wrench = msg
@@ -1728,7 +1649,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
         self.get_logger().info(">> State 6: execute_with_compliance() - 执行搬运(中心旋转模式)")
 
-        # 保留原有“补偿抬升”逻辑，避免旋转中擦碰桌面
+        # 保留“补偿抬升”逻辑，避免旋转中擦碰桌面
         current_ee_z = await self._estimate_dual_ee_z()
         target_transport_z = float(self.LIFT_HEIGHT + float(getattr(self, 'transport_lift_extra', 0.0)))
         if current_ee_z is None:
@@ -1828,265 +1749,6 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.get_logger().info("✓ 中心旋转任务完成，进入开爪放置阶段")
         await asyncio.sleep(max(0.0, float(getattr(self, 'state_transition_pause_sec', 0.08))))
         self.current_state = TaskState.OPEN_GRIPPERS
-
-    def _expand_joint_param_vector(self, raw_value, fallback: float):
-        n_joints = len(getattr(self, 'all_arm_joints', []))
-        if n_joints <= 0:
-            return np.array([], dtype=float)
-
-        if isinstance(raw_value, (list, tuple, np.ndarray)):
-            values = [float(v) for v in raw_value]
-            if len(values) == n_joints:
-                return np.array(values, dtype=float)
-            # 允许只给单臂 7 关节参数，自动镜像到左右臂
-            if n_joints % 2 == 0 and len(values) == (n_joints // 2):
-                return np.array(values + values, dtype=float)
-
-        try:
-            scalar = float(raw_value)
-        except Exception:
-            scalar = float(fallback)
-        return np.full((n_joints,), scalar, dtype=float)
-
-    def _read_joint_feedback_vectors(self):
-        q_vec = []
-        dq_vec = []
-        missing = []
-        for joint_name in self.all_arm_joints:
-            q = self.current_joint_state.get(joint_name, None)
-            dq = self.current_joint_velocity.get(joint_name, None)
-            if q is None:
-                missing.append(joint_name)
-                q = 0.0
-            if dq is None:
-                missing.append(joint_name)
-                dq = 0.0
-            q_vec.append(float(q))
-            dq_vec.append(float(dq))
-        return np.array(q_vec, dtype=float), np.array(dq_vec, dtype=float), sorted(set(missing))
-
-    def _publish_dual_joint_velocity(self, command):
-        msg = Float64MultiArray()
-        msg.data = [float(v) for v in command]
-        self.dual_joint_vel_pub.publish(msg)
-
-    def _sample_joint_reference(self, t_sec, t_vec, q_mat, dq_mat):
-        if t_sec <= float(t_vec[0]):
-            return q_mat[0], dq_mat[0]
-        if t_sec >= float(t_vec[-1]):
-            return q_mat[-1], dq_mat[-1]
-        idx = int(np.searchsorted(t_vec, t_sec, side='right'))
-        idx = max(1, min(idx, len(t_vec) - 1))
-        i0 = idx - 1
-        i1 = idx
-        t0 = float(t_vec[i0])
-        t1 = float(t_vec[i1])
-        if (t1 - t0) <= 1e-9:
-            return q_mat[i0], dq_mat[i0]
-        ratio = (float(t_sec) - t0) / (t1 - t0)
-        q_ref = q_mat[i0] + ratio * (q_mat[i1] - q_mat[i0])
-        dq_ref = dq_mat[i0] + ratio * (dq_mat[i1] - dq_mat[i0])
-        return q_ref, dq_ref
-
-    async def _activate_cascade_velocity_mode(self):
-        controllers = await self._list_controllers_async()
-        if not controllers:
-            self.get_logger().warn("串级 PID: 无法读取控制器状态")
-            return False
-
-        vel_name = str(getattr(self, 'dual_joint_velocity_controller_name', 'dual_joint_group_velocity_controller'))
-        if vel_name not in controllers:
-            self.get_logger().warn(f"串级 PID: 未找到速度控制器 {vel_name}")
-            return False
-
-        activate = []
-        deactivate = []
-        if controllers[vel_name] != 'active':
-            activate.append(vel_name)
-        if (
-            self.trajectory_controller_name in controllers and
-            controllers[self.trajectory_controller_name] == 'active'
-        ):
-            deactivate.append(self.trajectory_controller_name)
-
-        if not activate and not deactivate:
-            return True
-
-        ok = await self._switch_controllers_async(activate, deactivate)
-        if not ok:
-            self.get_logger().warn(
-                f"串级 PID: 控制器切换失败 activate={activate}, deactivate={deactivate}")
-            return False
-        self.get_logger().info(
-            f"串级 PID: 控制器切换成功 activate={activate}, deactivate={deactivate}")
-        return True
-
-    async def _execute_merged_trajectory_cascade_pid(self, merged, t_unified):
-        n_joints = len(self.all_arm_joints)
-        if n_joints <= 0 or len(merged.points) < 2 or len(t_unified) < 2:
-            self.get_logger().warn("串级 PID: 轨迹点不足，无法执行")
-            return False
-        if self.dual_joint_vel_pub is None:
-            self.get_logger().warn("串级 PID: 速度控制发布器不可用")
-            return False
-
-        auto_switch = bool(getattr(self, 'cascade_pid_auto_switch_controllers', True))
-        switched = False
-        if auto_switch:
-            if not await self._activate_cascade_velocity_mode():
-                return False
-            switched = True
-
-        rate_hz = max(60.0, float(getattr(self, 'cascade_pid_loop_hz', 120.0)))
-        loop_period = 1.0 / rate_hz
-        total_sec = float(t_unified[-1])
-        timeout_pad = max(0.5, float(getattr(self, 'cascade_pid_timeout_pad_sec', 2.0)))
-        outer_i_clamp = max(1e-4, float(getattr(self, 'cascade_pid_outer_i_clamp', 0.20)))
-        inner_i_clamp = max(1e-4, float(getattr(self, 'cascade_pid_inner_i_clamp', 0.35)))
-        outer_v_limit = max(0.05, float(getattr(self, 'cascade_pid_outer_v_limit', 0.70)))
-        cmd_max_vel = max(outer_v_limit, float(getattr(self, 'cascade_pid_cmd_max_vel', 0.85)))
-        cmd_max_acc = max(0.10, float(getattr(self, 'cascade_pid_cmd_max_acc', 2.20)))
-        finish_pos_tol = max(0.001, float(getattr(self, 'cascade_pid_finish_pos_tol', 0.008)))
-        finish_vel_tol = max(0.005, float(getattr(self, 'cascade_pid_finish_vel_tol', 0.050)))
-        finish_hold_sec = max(0.03, float(getattr(self, 'cascade_pid_finish_hold_sec', 0.12)))
-
-        outer_kp = self._expand_joint_param_vector(getattr(self, 'cascade_pid_outer_kp', 4.0), 4.0)
-        outer_ki = self._expand_joint_param_vector(getattr(self, 'cascade_pid_outer_ki', 0.05), 0.05)
-        outer_kd = self._expand_joint_param_vector(getattr(self, 'cascade_pid_outer_kd', 0.10), 0.10)
-        inner_kp = self._expand_joint_param_vector(getattr(self, 'cascade_pid_inner_kp', 0.80), 0.80)
-        inner_ki = self._expand_joint_param_vector(getattr(self, 'cascade_pid_inner_ki', 0.10), 0.10)
-        inner_kd = self._expand_joint_param_vector(getattr(self, 'cascade_pid_inner_kd', 0.02), 0.02)
-
-        if (
-            len(outer_kp) != n_joints or len(outer_ki) != n_joints or len(outer_kd) != n_joints or
-            len(inner_kp) != n_joints or len(inner_ki) != n_joints or len(inner_kd) != n_joints
-        ):
-            self.get_logger().warn("串级 PID: 增益维度错误")
-            return False
-
-        t_vec = np.array(t_unified, dtype=float)
-        q_mat = np.array([list(pt.positions) for pt in merged.points], dtype=float)
-        if q_mat.shape != (len(merged.points), n_joints):
-            self.get_logger().warn(
-                f"串级 PID: 轨迹维度异常 q_mat={q_mat.shape}, expected=({len(merged.points)}, {n_joints})")
-            return False
-
-        has_vel = True
-        for pt in merged.points:
-            if len(getattr(pt, 'velocities', []) or []) != n_joints:
-                has_vel = False
-                break
-        if has_vel:
-            dq_mat = np.array([list(pt.velocities) for pt in merged.points], dtype=float)
-        else:
-            dq_mat = np.zeros_like(q_mat)
-            for i in range(len(t_vec)):
-                if i == 0:
-                    dt = max(1e-6, t_vec[1] - t_vec[0])
-                    dq_mat[i] = (q_mat[1] - q_mat[0]) / dt
-                elif i == len(t_vec) - 1:
-                    dt = max(1e-6, t_vec[-1] - t_vec[-2])
-                    dq_mat[i] = (q_mat[-1] - q_mat[-2]) / dt
-                else:
-                    dt = max(1e-6, t_vec[i + 1] - t_vec[i - 1])
-                    dq_mat[i] = (q_mat[i + 1] - q_mat[i - 1]) / dt
-
-        # 等待一次完整反馈，避免刚切换控制器就拿到空状态
-        ready_deadline = float(self.get_clock().now().nanoseconds) * 1e-9 + 1.0
-        while True:
-            _, _, missing = self._read_joint_feedback_vectors()
-            if not missing:
-                break
-            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
-            if now_sec >= ready_deadline:
-                self.get_logger().warn(f"串级 PID: 关节反馈缺失 {missing}")
-                return False
-            await asyncio.sleep(0.01)
-
-        outer_i = np.zeros((n_joints,), dtype=float)
-        inner_i = np.zeros((n_joints,), dtype=float)
-        prev_pos_err = np.zeros((n_joints,), dtype=float)
-        prev_vel_err = np.zeros((n_joints,), dtype=float)
-        prev_cmd = np.zeros((n_joints,), dtype=float)
-        finish_hold = 0.0
-        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
-        prev_loop_sec = start_sec
-
-        self.get_logger().info(
-            f"执行合并轨迹(串级PID): {len(merged.points)}点, total={total_sec:.2f}s, rate={rate_hz:.1f}Hz")
-
-        try:
-            while True:
-                loop_begin = float(self.get_clock().now().nanoseconds) * 1e-9
-                elapsed = loop_begin - start_sec
-                if elapsed > (total_sec + timeout_pad):
-                    self.get_logger().warn(
-                        f"串级 PID 执行超时: elapsed={elapsed:.2f}s, limit={total_sec + timeout_pad:.2f}s")
-                    return False
-
-                dt = max(1e-3, min(0.05, loop_begin - prev_loop_sec))
-                prev_loop_sec = loop_begin
-
-                q_meas, dq_meas, missing = self._read_joint_feedback_vectors()
-                if missing:
-                    self.get_logger().warn(f"串级 PID 执行中反馈丢失: {missing}")
-                    return False
-
-                t_query = min(max(0.0, elapsed), total_sec)
-                q_ref, dq_ref = self._sample_joint_reference(t_query, t_vec, q_mat, dq_mat)
-
-                pos_err = q_ref - q_meas
-                outer_i = np.clip(outer_i + pos_err * dt, -outer_i_clamp, outer_i_clamp)
-                d_pos_err = (pos_err - prev_pos_err) / dt
-                v_ref = dq_ref + outer_kp * pos_err + outer_ki * outer_i + outer_kd * d_pos_err
-                v_ref = np.clip(v_ref, -outer_v_limit, outer_v_limit)
-
-                vel_err = v_ref - dq_meas
-                inner_i = np.clip(inner_i + vel_err * dt, -inner_i_clamp, inner_i_clamp)
-                d_vel_err = (vel_err - prev_vel_err) / dt
-                v_cmd = v_ref + inner_kp * vel_err + inner_ki * inner_i + inner_kd * d_vel_err
-
-                dv_max = cmd_max_acc * dt
-                v_cmd = prev_cmd + np.clip(v_cmd - prev_cmd, -dv_max, dv_max)
-                v_cmd = np.clip(v_cmd, -cmd_max_vel, cmd_max_vel)
-
-                self._publish_dual_joint_velocity(v_cmd)
-
-                prev_pos_err = pos_err
-                prev_vel_err = vel_err
-                prev_cmd = v_cmd
-
-                if elapsed >= total_sec:
-                    max_pos_err = float(np.max(np.abs(pos_err)))
-                    max_joint_vel = float(np.max(np.abs(dq_meas)))
-                    if max_pos_err <= finish_pos_tol and max_joint_vel <= finish_vel_tol:
-                        finish_hold += dt
-                    else:
-                        finish_hold = 0.0
-                    if finish_hold >= finish_hold_sec:
-                        self.get_logger().info(
-                            f"串级 PID 结束: max_pos_err={max_pos_err:.4f}rad, max_vel={max_joint_vel:.4f}rad/s")
-                        return True
-
-                spent = float(self.get_clock().now().nanoseconds) * 1e-9 - loop_begin
-                sleep_sec = loop_period - spent
-                if sleep_sec > 0.0:
-                    await asyncio.sleep(sleep_sec)
-                else:
-                    await asyncio.sleep(0.0)
-        finally:
-            try:
-                zero_cmd = np.zeros((n_joints,), dtype=float)
-                for _ in range(3):
-                    self._publish_dual_joint_velocity(zero_cmd)
-                    await asyncio.sleep(0.01)
-            except Exception:
-                pass
-            if switched:
-                try:
-                    await self.switch_to_trajectory_mode()
-                except Exception as e:
-                    self.get_logger().warn(f"串级 PID: 恢复轨迹控制器失败: {e}")
 
     async def _execute_merged_trajectory(self, left_traj, right_traj, time_scale=1.3):
         """将左右臂轨迹等时参数化合并为14-DOF轨迹并通过 dual_controller 执行"""
@@ -2297,17 +1959,11 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             merged.points[0].velocities = [0.0] * n_joints
             merged.points[-1].velocities = [0.0] * n_joints
 
-        total_sec = float(t_unified[-1]) if t_unified else 0.0
-        if bool(getattr(self, 'use_cascade_joint_pid', True)):
-            ok_cascade = await self._execute_merged_trajectory_cascade_pid(merged, t_unified)
-            if ok_cascade:
-                return True
-            self.get_logger().warn("串级 PID 执行失败，回退 FollowJointTrajectory")
-
         fjt_goal = FollowJointTrajectory.Goal()
         fjt_goal.trajectory = merged
         fjt_goal.goal_time_tolerance = Duration(sec=5, nanosec=0)
 
+        total_sec = float(t_unified[-1]) if t_unified else 0.0
         self.get_logger().info(f"执行合并轨迹: {len(merged.points)}点, {total_sec:.1f}s")
         try:
             gh = await asyncio.wait_for(
@@ -2757,16 +2413,10 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.GRASP_Z = self.BAR_RESTING_Z + self.TCP_OFFSET   # 0.4634
         self.PRE_GRASP_HEIGHT = self.GRASP_Z + 0.12            # 0.5834 (预抓取高于 12cm)
         self.LIFT_HEIGHT = self.GRASP_Z + 0.15                 # 0.6134 (提升 15cm)
-        if self._is_rotate_transport_mode():
-            # 旋转任务下不使用平移偏移量
-            self.TRANSPORT_X_OFFSET = 0.00
-            self.TRANSPORT_Y_OFFSET = 0.00
-            self.TRANSPORT_Z_OFFSET = 0.00
-        else:
-            # 传统平移任务：左前方总位移约 10 cm（x/y 各约 7.1 cm）
-            self.TRANSPORT_X_OFFSET = 0.071
-            self.TRANSPORT_Y_OFFSET = 0.071
-            self.TRANSPORT_Z_OFFSET = 0.00
+        # 左前方总位移约 10 cm（x/y 各约 7.1 cm）
+        self.TRANSPORT_X_OFFSET = 0.071
+        self.TRANSPORT_Y_OFFSET = 0.071
+        self.TRANSPORT_Z_OFFSET = 0.00
         self.get_logger().info(
             f"State6任务模式={self.transport_task_mode}, 平移偏移=("
             f"{self.TRANSPORT_X_OFFSET:.3f}, {self.TRANSPORT_Y_OFFSET:.3f}, {self.TRANSPORT_Z_OFFSET:.3f})"
