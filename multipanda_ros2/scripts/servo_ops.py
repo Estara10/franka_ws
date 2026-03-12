@@ -216,10 +216,32 @@ class ServoOpsMixin:
         alpha = max(0.5, min(0.98, float(getattr(self, 'compliance_lpf_alpha', 0.94))))
         max_v_z = max(0.002, float(getattr(self, 'compliance_max_v_z', 0.020)))
         max_v_y = max(0.002, float(getattr(self, 'compliance_max_v_y', 0.018)))
-        
+        force_alpha = max(0.0, min(0.995, float(getattr(self, 'compliance_force_lpf_alpha', 0.88))))
+        force_deadband_ratio = max(0.0, min(1.0, float(getattr(self, 'compliance_force_deadband_ratio', 0.20))))
+        dist_deadband = max(0.0, float(getattr(self, 'compliance_dist_deadband', 0.0015)))
+        v_slew_per_cycle = max(1e-5, float(getattr(self, 'compliance_v_slew_per_cycle', 0.0010)))
+        z_force_threshold = max(0.1, float(getattr(self, 'expected_force_diff_threshold', 7.5)))
+        z_force_deadband = z_force_threshold * force_deadband_ratio
+        y_force_deadband = force_y_threshold * force_deadband_ratio
+
         self.compliance_v_z = 0.0
         self.compliance_v_y = 0.0
-        
+        filt_delta_f_z = 0.0
+        filt_delta_f_y = 0.0
+
+        def _deadband(value, threshold):
+            if abs(value) <= threshold:
+                return 0.0
+            return float(value - np.sign(value) * threshold)
+
+        def _slew(prev, target, step_limit):
+            dv = float(target) - float(prev)
+            if dv > step_limit:
+                return float(prev) + step_limit
+            if dv < -step_limit:
+                return float(prev) - step_limit
+            return float(target)
+
         while self.compliance_task_active:
             # ---- 去皮后受力读取 ----
             # 注意：假设 Wrench 帧与 planning_frame 轴向一致（简化处理）
@@ -230,9 +252,12 @@ class ServoOpsMixin:
             f_slave_y  = self.current_right_wrench.wrench.force.y - self.right_force_bias['y']
             
             # Z轴合力差：主臂上推多，说明从臂应跟上
-            delta_f_z = f_master_z - f_slave_z
+            delta_f_z_raw = f_master_z - f_slave_z
             # Y轴内应力总量：两臂夹持力之和，超过阈值需向外释放
-            delta_f_y = abs(f_master_y) + abs(f_slave_y)
+            delta_f_y_raw = abs(f_master_y) + abs(f_slave_y)
+            # 对力差信号做低通，抑制噪声驱动导致的晃动
+            filt_delta_f_z = force_alpha * filt_delta_f_z + (1.0 - force_alpha) * delta_f_z_raw
+            filt_delta_f_y = force_alpha * filt_delta_f_y + (1.0 - force_alpha) * delta_f_y_raw
 
             # ---- 弹簧位置恢复项（同步查询 TF，使用 timeout=0 非阻塞）----
             dist_p_term_y = 0.0
@@ -252,32 +277,34 @@ class ServoOpsMixin:
                 # Y轴间距弹簧：实际Y间距偏离初始偏移量时产生恢复速度
                 actual_dist_y = actual_master_y - actual_slave_y
                 dist_error_y  = self.traj_offset_y - actual_dist_y
+                if abs(dist_error_y) < dist_deadband:
+                    dist_error_y = 0.0
                 dist_p_term_y = Kp_dist * dist_error_y
 
                 # Z轴对齐弹簧：两臂应保持Z高度同步
-                dist_error_z  = actual_master_z - actual_slave_z  # 期望为 traj_offset_z
-                dist_p_term_z = Kp_dist * (self.traj_offset_z - dist_error_z)
+                dist_error_z = self.traj_offset_z - (actual_master_z - actual_slave_z)
+                if abs(dist_error_z) < dist_deadband:
+                    dist_error_z = 0.0
+                dist_p_term_z = Kp_dist * dist_error_z
             except Exception:
                 pass  # TF 暂时不可用时保持上一帧的补偿值
 
             # ---- Z轴柔顺补偿 ----
-            # 控制律：v_z = ΔFz/Kd_z * gain + Kp_dist*距离误差
-            # 低通滤波（0.8/0.2 alpha）防止高频噪声导致振荡
-            if abs(delta_f_z) > self.expected_force_diff_threshold:
-                target_v_z = (delta_f_z / Kd_z) * force_gain + dist_p_term_z
-                self.compliance_v_z = alpha * self.compliance_v_z + (1.0 - alpha) * target_v_z
-            else:
-                # 无显著力差时，仅靠弹簧项维持间距同步
-                self.compliance_v_z = alpha * self.compliance_v_z + (1.0 - alpha) * dist_p_term_z
-                
+            # 仅使用超过阈值部分作为力控驱动，避免阈值附近来回抖动
+            delta_f_z_eff = _deadband(filt_delta_f_z, z_force_threshold + z_force_deadband)
+            target_v_z = (delta_f_z_eff / Kd_z) * force_gain + dist_p_term_z
+
             # ---- Y轴柔顺补偿 ----
-            # 内应力超过 20N 阈值时，向外（远离物体）释放
-            if delta_f_y > force_y_threshold:
-                target_v_y = ((delta_f_y - force_y_threshold) / Kd_y) * force_gain + dist_p_term_y
-                # 符号取反：内应力增大 -> 从臂向外移动（y 变小）
-                self.compliance_v_y = alpha * self.compliance_v_y + (1.0 - alpha) * (-target_v_y)
-            else:
-                self.compliance_v_y = alpha * self.compliance_v_y + (1.0 - alpha) * dist_p_term_y
+            # 内应力超过阈值后再释放，且仅使用超阈值部分
+            excess_f_y = max(0.0, filt_delta_f_y - force_y_threshold - y_force_deadband)
+            release_v_y = (excess_f_y / Kd_y) * force_gain
+            target_v_y = dist_p_term_y - release_v_y
+
+            # 先做一阶滤波，再做每周期斜率限制，避免速度指令突变
+            target_v_z = alpha * self.compliance_v_z + (1.0 - alpha) * target_v_z
+            target_v_y = alpha * self.compliance_v_y + (1.0 - alpha) * target_v_y
+            self.compliance_v_z = _slew(self.compliance_v_z, target_v_z, v_slew_per_cycle)
+            self.compliance_v_y = _slew(self.compliance_v_y, target_v_y, v_slew_per_cycle)
 
             self.compliance_v_z = max(-max_v_z, min(max_v_z, float(self.compliance_v_z)))
             self.compliance_v_y = max(-max_v_y, min(max_v_y, float(self.compliance_v_y)))
@@ -377,4 +404,3 @@ class ServoOpsMixin:
         self.servo_pub_left.publish(left_twist)
         self.servo_pub_right.publish(right_twist)
         return True
-

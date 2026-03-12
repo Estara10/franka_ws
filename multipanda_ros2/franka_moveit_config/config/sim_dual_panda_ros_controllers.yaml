@@ -13,6 +13,9 @@ controller_manager:
     dual_panda_arm_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
+    dual_joint_group_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
@@ -44,3 +47,21 @@ dual_panda_arm_controller:
     constraints:
       stopped_velocity_tolerance: 0.01
       goal_time: 0.0
+
+dual_joint_group_velocity_controller:
+  ros__parameters:
+    joints:
+      - mj_left_joint1
+      - mj_left_joint2
+      - mj_left_joint3
+      - mj_left_joint4
+      - mj_left_joint5
+      - mj_left_joint6
+      - mj_left_joint7
+      - mj_right_joint1
+      - mj_right_joint2
+      - mj_right_joint3
+      - mj_right_joint4
+      - mj_right_joint5
+      - mj_right_joint6
+      - mj_right_joint7

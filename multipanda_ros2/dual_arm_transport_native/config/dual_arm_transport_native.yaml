@@ -1,0 +1,65 @@
+dual_arm_transport_native_node:
+  ros__parameters:
+    merged_trajectory_topic: /dual_arm_transport_native/merged_trajectory
+    cartesian_delta_topic: /dual_arm_transport_native/cartesian_delta_cmd
+    cartesian_targets_topic: /dual_arm_transport_native/cartesian_targets_cmd
+    state6_task_topic: /dual_arm_transport_native/state6_task_cmd
+    velocity_command_topic: /dual_joint_group_velocity_controller/commands
+    status_topic: /dual_arm_transport_native/status
+    trajectory_action_name: /dual_panda_arm_controller/follow_joint_trajectory
+
+    trajectory_controller_name: dual_panda_arm_controller
+    velocity_controller_name: dual_joint_group_velocity_controller
+
+    use_cascade_joint_pid: true
+    cascade_pid_auto_switch_controllers: true
+    enable_native_cartesian_delta: true
+    enable_native_state6_task: true
+    planning_frame: base_link
+    left_group_name: mj_left_arm
+    right_group_name: mj_right_arm
+    left_ee_link: mj_left_link8
+    right_ee_link: mj_right_link8
+    cartesian_fraction_threshold: 0.98
+    cartesian_default_max_step: 0.006
+    cartesian_default_target_speed: 0.018
+    merge_default_time_scale: 1.2
+    merge_min_dt: 0.04
+    merge_max_joint_vel: 0.30
+    merge_max_joint_acc: 0.45
+    merge_vel_lpf: 0.84
+
+    cascade_pid_loop_hz: 120.0
+    cascade_pid_outer_i_clamp: 0.20
+    cascade_pid_inner_i_clamp: 0.35
+    cascade_pid_outer_v_limit: 0.70
+    cascade_pid_cmd_max_vel: 0.85
+    cascade_pid_cmd_max_acc: 2.20
+    cascade_pid_finish_pos_tol: 0.008
+    cascade_pid_finish_vel_tol: 0.050
+    cascade_pid_finish_hold_sec: 0.12
+    cascade_pid_timeout_pad_sec: 2.0
+    action_goal_time_tolerance_sec: 5.0
+
+    joint_names:
+      - mj_left_joint1
+      - mj_left_joint2
+      - mj_left_joint3
+      - mj_left_joint4
+      - mj_left_joint5
+      - mj_left_joint6
+      - mj_left_joint7
+      - mj_right_joint1
+      - mj_right_joint2
+      - mj_right_joint3
+      - mj_right_joint4
+      - mj_right_joint5
+      - mj_right_joint6
+      - mj_right_joint7
+
+    cascade_pid_outer_kp: [4.2, 4.2, 4.2, 4.0, 3.2, 3.0, 2.6, 4.2, 4.2, 4.2, 4.0, 3.2, 3.0, 2.6]
+    cascade_pid_outer_ki: [0.06, 0.06, 0.06, 0.05, 0.04, 0.04, 0.03, 0.06, 0.06, 0.06, 0.05, 0.04, 0.04, 0.03]
+    cascade_pid_outer_kd: [0.11, 0.11, 0.11, 0.09, 0.07, 0.07, 0.05, 0.11, 0.11, 0.11, 0.09, 0.07, 0.07, 0.05]
+    cascade_pid_inner_kp: [0.85, 0.85, 0.85, 0.80, 0.65, 0.60, 0.50, 0.85, 0.85, 0.85, 0.80, 0.65, 0.60, 0.50]
+    cascade_pid_inner_ki: [0.12, 0.12, 0.12, 0.10, 0.08, 0.08, 0.06, 0.12, 0.12, 0.12, 0.10, 0.08, 0.08, 0.06]
+    cascade_pid_inner_kd: [0.020, 0.020, 0.020, 0.018, 0.015, 0.015, 0.012, 0.020, 0.020, 0.020, 0.018, 0.015, 0.015, 0.012]

@@ -195,7 +195,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             fallback_bar_z_param,
-            default_value='0.36',
+            default_value='0.16',
             description='Fallback long_bar z in base_link frame.'
         ),
         DeclareLaunchArgument(
@@ -272,6 +272,27 @@ def generate_launch_description():
             executable='spawner',
             arguments=[
                 'joint_state_broadcaster',
+                '-c', concatenate_ns(ns, 'controller_manager', True),
+                '--controller-manager-timeout', '120'
+            ],
+            output='screen',
+        ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                'dual_panda_arm_controller',
+                '-c', concatenate_ns(ns, 'controller_manager', True),
+                '--controller-manager-timeout', '120'
+            ],
+            output='screen',
+        ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                'dual_joint_group_velocity_controller',
+                '--inactive',
                 '-c', concatenate_ns(ns, 'controller_manager', True),
                 '--controller-manager-timeout', '120'
             ],
