@@ -250,6 +250,13 @@ def generate_launch_description():
                 output='screen',
             )
         ]
+    load_controllers += [
+        ExecuteProcess(
+            cmd=['ros2 run controller_manager spawner dual_joint_group_velocity_controller --inactive'],
+            shell=True,
+            output='screen',
+        )
+    ]
 
     # Warehouse mongodb server
     db_config = LaunchConfiguration('db')

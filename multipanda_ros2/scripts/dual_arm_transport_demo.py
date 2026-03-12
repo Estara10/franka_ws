@@ -15,10 +15,15 @@ from moveit_msgs.srv import GetPositionIK, GetPositionFK, GetCartesianPath
 from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, BoundingVolume, PlanningScene
 from shape_msgs.msg import SolidPrimitive
 from control_msgs.action import GripperCommand, FollowJointTrajectory
-from controller_manager_msgs.srv import SwitchController, ListControllers
+from controller_manager_msgs.srv import (
+    SwitchController,
+    ListControllers,
+    LoadController,
+    ConfigureController,
+)
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import PoseStamped, Quaternion, WrenchStamped, TwistStamped
 from action_msgs.msg import GoalStatus
@@ -121,10 +126,49 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.dual_joint_vel_pub = self.create_publisher(
             Float64MultiArray, '/dual_joint_group_velocity_controller/commands', 10
         )
+        # 可选原生执行器桥接（C/C++ 节点）：保持 Python 状态机不变，仅替换轨迹执行层
+        self.use_native_trajectory_executor = str(
+            os.getenv('USE_NATIVE_TRAJ_EXECUTOR', '0')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        self.use_native_cartesian_executor = str(
+            os.getenv('USE_NATIVE_CART_EXECUTOR', '0')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        native_state6_env = os.getenv(
+            'USE_NATIVE_STATE6_EXECUTOR',
+            os.getenv('USE_NATIVE_CART_EXECUTOR', '0'),
+        )
+        self.use_native_state6_executor = str(
+            native_state6_env
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        self.native_executor_result_timeout_pad_sec = 4.0
+        self.native_merged_traj_topic = '/dual_arm_transport_native/merged_trajectory'
+        self.native_cartesian_cmd_topic = '/dual_arm_transport_native/cartesian_delta_cmd'
+        self.native_cartesian_targets_topic = '/dual_arm_transport_native/cartesian_targets_cmd'
+        self.native_state6_task_topic = '/dual_arm_transport_native/state6_task_cmd'
+        self.native_status_topic = '/dual_arm_transport_native/status'
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+        self.native_merged_traj_pub = self.create_publisher(
+            JointTrajectory, self.native_merged_traj_topic, 10
+        )
+        self.native_cartesian_cmd_pub = self.create_publisher(
+            Float64MultiArray, self.native_cartesian_cmd_topic, 10
+        )
+        self.native_cartesian_targets_pub = self.create_publisher(
+            Float64MultiArray, self.native_cartesian_targets_topic, 10
+        )
+        self.native_state6_task_pub = self.create_publisher(
+            Float64MultiArray, self.native_state6_task_topic, 10
+        )
+        self.native_status_sub = self.create_subscription(
+            String, self.native_status_topic, self._native_exec_status_cb, 10,
+            callback_group=self.cb_group_sub
+        )
         
         self.current_joint_state = {}
         self.current_joint_velocity = {}
         self._last_joint_state_stamp_sec = None
+        self._cascade_pid_controller_missing_warned = False
         # 赋予初始全0状态防报错
         self.current_left_wrench = WrenchStamped()
         self.current_right_wrench = WrenchStamped()
@@ -157,6 +201,10 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.cartesian_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
         self.switch_ctrl_client = self.create_client(SwitchController, '/controller_manager/switch_controller')
         self.list_ctrl_client = self.create_client(ListControllers, '/controller_manager/list_controllers')
+        self.load_ctrl_client = self.create_client(LoadController, '/controller_manager/load_controller')
+        self.configure_ctrl_client = self.create_client(
+            ConfigureController, '/controller_manager/configure_controller'
+        )
 
         self.joint_state_sub = self.create_subscription(JointState, '/joint_states', self._joint_state_cb, 10, callback_group=self.cb_group_sub)
         
@@ -167,7 +215,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         # --- 状态与关节设定 (Variables configuration) ---
         self.BAR_CENTER_X = 0.5
         self.BAR_CENTER_Y = 0.0
-        self.BAR_CENTER_Z = 0.36
+        self.BAR_CENTER_Z = 0.16
         self.planning_frame = "base_link"  # 提前初始化，防止 servo_move_cartesian 等函数在 execute_task_flow 前调用报错
         self.left_arm_joints =[f'mj_left_joint{i}' for i in range(1, 8)]
         self.right_arm_joints =[f'mj_right_joint{i}' for i in range(1, 8)]
@@ -192,30 +240,41 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.home_joint_positions_right = list(_home)
         # 中期演示默认参数：优先连续性与可录制性
         self.midterm_demo_mode = True
-        self.max_servo_linear_speed = 0.045  # m/s
-        self.servo_ramp_ratio = 0.36
+        self.max_servo_linear_speed = 0.030  # m/s
+        self.servo_ramp_ratio = 0.40
         self.servo_phase_lift_delta = 0.10
         self.servo_phase_release_down_delta = -0.08
         self.watchdog_force_limit = 130.0   # N
         self.watchdog_force_trip_count = 3  # 连续超限计数，抑制瞬时尖峰误触发
         # 双臂笛卡尔搬运平滑参数（抑制抬升/平移阶段晃动）
-        self.cooperative_lift_speed = 0.022        # m/s
-        self.cooperative_transport_speed = 0.016   # m/s
-        self.cooperative_cartesian_speed = 0.022   # m/s (默认)
+        self.cooperative_lift_speed = 0.018        # m/s
+        self.cooperative_transport_speed = 0.014   # m/s
+        self.cooperative_cartesian_speed = 0.014   # m/s (默认)
         self.cartesian_segment_settle_sec = 0.0    # 段间停顿，默认关闭以提升连续性
-        self.state_transition_pause_sec = 0.03     # 状态切换短暂停顿（过长会造成“停一下再走”体感）
+        self.state_transition_pause_sec = 0.02     # 状态切换短暂停顿（过长会造成“停一下再走”体感）
         self.lift_cartesian_settle_sec = 0.0       # 抬升阶段关闭段间停顿，避免“卡顿上升”
         self.lift_cartesian_max_segment = 0.25     # 抬升优先单段执行
         self.lift_cartesian_retry_segment = 0.08   # 单段失败时的分段重试长度
-        self.grasp_descent_speed = 0.010           # m/s, 下探速度目标（过快易突降）
+        self.grasp_descent_speed = 0.011           # m/s, 下探速度目标
         self.grasp_cartesian_max_step = 0.005      # m, 下探笛卡尔插值步长
-        self.grasp_cartesian_split_height = 0.030  # m, 大位移下探时插入中间航点
+        self.grasp_cartesian_split_height = 0.25   # m, 提升为大值避免下探阶段插入中间航点停顿
         self.grasp_cartesian_align_xy_first = True
         self.grasp_cartesian_waypoint_xy_tol = 0.003
+        self.grasp_post_descent_settle_sec = 0.02
+        self.grasp_single_descent_mode = True
+        self.grasp_descent_final_extra = 0.006     # m, 单次直达的额外下探深度
         self.pregrasp_align_xy_tol = 0.003
+        self.pregrasp_align_x_tol = 0.002
+        self.pregrasp_align_pair_x_tol = 0.003
         self.pregrasp_align_z_tol = 0.003
         self.pregrasp_align_z_gap_tol = 0.002
         self.pregrasp_refine_pos_tol = 0.004
+        self.pregrasp_align_cartesian_first = True
+        self.pregrasp_align_cartesian_speed = 0.006
+        self.pregrasp_align_cartesian_max_step = 0.003
+        self.pregrasp_align_verify_loops = 3
+        self.pregrasp_align_force_x_recenter = True   # 软门控下若 X 仍有残差，执行额外中心线复位
+        self.pregrasp_align_recenter_max_loops = 2
         self.pregrasp_z_offset = 0.0                # m, 双臂共用预抓取高度偏置
         self.enforce_level_pregrasp = True          # 预抓取阶段双臂强制同高
         self.strict_pregrasp_gate = True            # 预抓取验收不允许 demo 模式强行继续
@@ -223,10 +282,12 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.pregrasp_right_z_offset = 0.0          # m, 仅在禁用同高策略时生效
         self.enable_pregrasp_force_align = True   # 起始规划稳态优先，必要时再开启强制对齐
         self.pregrasp_force_align_xy_tol = 0.003
+        self.pregrasp_force_align_x_tol = 0.002
+        self.pregrasp_force_align_pair_x_tol = 0.003
         self.pregrasp_force_align_z_gap_tol = 0.002
         self.pregrasp_force_align_pos_tol = 0.003
         self.pregrasp_force_align_use_cartesian = True
-        self.pregrasp_force_align_speed = 0.010
+        self.pregrasp_force_align_speed = 0.008
         self.pregrasp_force_align_max_jump = 0.035
         self.pregrasp_force_align_current_delta_boost = 0.24
         self.pregrasp_force_align_settle_sec = 0.08
@@ -235,6 +296,16 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.grasp_site_half_span = 0.10               # m, 对齐 dual_scene.xml grasp_site ±0.10m
         self.grasp_axis_tie_eps = 1e-4                 # 抓取轴判定平票阈值（平票时强制走 local Y）
         self.pregrasp_min_lateral_spacing = 0.16       # m, 预抓取最小横向(Y)间距，防止双臂落在同一中线
+        self.pregrasp_centerline_x_lock = True         # 目标近似平行Y轴时，强制左右抓点共用中心X
+        self.pregrasp_centerline_x_lock_tol = 0.06     # m, 若左右抓点X差小于该阈值则锁定中心X
+        # 双臂搬运几何锁定：抑制搬运中左右末端相对偏移积累，避免铝条越搬越偏
+        self.enable_dual_pair_lock = True
+        self.dual_pair_lock_tol = 0.0035               # m, 允许的左右相对偏差
+        self.dual_pair_lock_max_correction = 0.012     # m, 单次纠偏上限（每轴）
+        self.dual_pair_lock_max_step = 0.003           # m, 纠偏笛卡尔插值步长
+        self.dual_pair_lock_speed = 0.010              # m/s, 纠偏速度
+        self.dual_pair_lock_settle_sec = 0.03
+        self.dual_pair_lock_verify_loops = 2
         self.publish_mock_target_tf = False            # 默认不发布假 target_bar TF，避免覆盖真实 long_bar
         # IK 构型自然化：多种子求解并偏向“接近 home + 远离限位”的解
         self.enable_natural_ik_bias = True
@@ -244,7 +315,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.natural_ik_current_delta_weight = 0.06    # 与当前姿态差异惩罚系数
         self.natural_ik_home_weights = [0.7, 1.0, 0.6, 1.3, 0.4, 0.5, 0.9]
         self.natural_ik_pregrasp_penalty_scale = 0.18
-        self.transport_cartesian_max_step = 0.006
+        self.transport_cartesian_max_step = 0.0045
         self.transport_cartesian_retry_segment = 0.08
         self.transport_cartesian_one_shot_margin = 0.02
         self.transport_cartesian_settle_sec = 0.0
@@ -263,7 +334,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         # 旋转任务执行策略：笛卡尔优先，失败再回退 IK 规划
         self.transport_rotate_cartesian_first = True
         self.transport_rotate_cartesian_max_step = 0.004
-        self.transport_rotate_speed = 0.006
+        self.transport_rotate_speed = 0.0055
         self.transport_rotate_cartesian_fraction_threshold = 0.94
         # 默认不自动退化为“只转位置”，以保证夹爪始终跟随铝条姿态
         self.transport_rotate_try_without_orientation = False
@@ -278,11 +349,11 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.cartesian_fraction_threshold = 0.980
         self.cartesian_one_shot_fraction_threshold = 0.985
         # 轨迹执行平滑参数（抑制“走走停停”引发的全程晃动）
-        self.dual_traj_max_joint_vel = 0.30        # rad/s
-        self.dual_traj_max_joint_acc = 0.45        # rad/s^2
-        self.dual_traj_vel_lpf = 0.84              # 速度一阶低通系数
-        self.dual_traj_min_dt = 0.04               # s, 相邻轨迹点最小时间间隔
-        self.dual_traj_resample_dt = 0.06          # s, 轨迹重采样时间步长
+        self.dual_traj_max_joint_vel = 0.20        # rad/s
+        self.dual_traj_max_joint_acc = 0.22        # rad/s^2
+        self.dual_traj_vel_lpf = 0.94              # 速度一阶低通系数（更平滑）
+        self.dual_traj_min_dt = 0.05               # s, 相邻轨迹点最小时间间隔
+        self.dual_traj_resample_dt = 0.07          # s, 轨迹重采样时间步长
         self.dual_traj_resample_gap_trigger = 0.18 # s, 点间时间超过该阈值时触发重采样
         self.dual_traj_resample_max_points = 260   # 防止长轨迹点数过多
         self.dual_traj_start_err_tol = 0.0075      # rad, 首点偏差触发平滑引入
@@ -291,7 +362,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.dual_traj_lead_in_max_sec = 0.90      # s
         self.dual_traj_mid_blend_ratio = 0.45      # 两段式引入中点比例
         # 串级 PID（关节外环位置 + 内环速度）参数：每关节独立增益
-        self.use_cascade_joint_pid = True
+        self.use_cascade_joint_pid = False
         self.cascade_pid_auto_switch_controllers = True
         self.cascade_pid_loop_hz = 120.0
         self.cascade_pid_outer_kp = [
@@ -321,20 +392,24 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.cascade_pid_outer_i_clamp = 0.20      # rad*s
         self.cascade_pid_inner_i_clamp = 0.35      # (rad/s)*s
         self.cascade_pid_outer_v_limit = 0.70      # rad/s
-        self.cascade_pid_cmd_max_vel = 0.85        # rad/s
-        self.cascade_pid_cmd_max_acc = 2.20        # rad/s^2
+        self.cascade_pid_cmd_max_vel = 0.82        # rad/s
+        self.cascade_pid_cmd_max_acc = 1.80        # rad/s^2
         self.cascade_pid_finish_pos_tol = 0.008    # rad
         self.cascade_pid_finish_vel_tol = 0.050    # rad/s
-        self.cascade_pid_finish_hold_sec = 0.12    # s
+        self.cascade_pid_finish_hold_sec = 0.10    # s
         self.cascade_pid_timeout_pad_sec = 2.0     # s
-        self.moveit_joint_vel_scale = 0.20
-        self.moveit_joint_acc_scale = 0.12
-        self.sync_plan_vel_scale = 0.20
-        self.sync_plan_acc_scale = 0.12
+        self.moveit_joint_vel_scale = 0.22
+        self.moveit_joint_acc_scale = 0.10
+        self.sync_plan_vel_scale = 0.22
+        self.sync_plan_acc_scale = 0.10
         self.sync_plan_joint_tolerance = 0.04         # rad, 同步 plan-only 关节目标容差
         self.sync_plan_max_end_joint_error = 0.05     # rad, 轨迹末点相对 IK 目标的最大误差
         self.sync_plan_allow_collision_ik_fallback = False
-        self.sync_merge_time_scale = 1.20
+        self.sync_merge_time_scale = 1.30
+        self.sync_move_cartesian_fallback_on_plan_fail = True
+        self.sync_move_cartesian_fallback_max_step = 0.004
+        self.sync_move_cartesian_fallback_speed = 0.010
+        self.sync_move_cartesian_fallback_fraction_threshold = 0.92
         # 柔顺控制阻抗参数（低晃动优先）
         self.compliance_kd_z = 340.0
         self.compliance_kd_y = 280.0
@@ -349,12 +424,12 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.compliance_dist_deadband = 0.0015
         self.compliance_v_slew_per_cycle = 0.0010
         # 放置阶段参数（避免直接“丢下”）
-        self.place_release_clearance = 0.012       # m, 开爪时离桌面的安全余量
-        self.place_descent_speed = 0.010           # m/s, 缓降速度
-        self.place_retreat_speed = 0.014           # m/s, 开爪后回抬速度
+        self.place_release_clearance = 0.005       # m, 开爪时离桌面的安全余量
+        self.place_descent_speed = 0.015           # m/s, 缓降速度
+        self.place_retreat_speed = 0.015           # m/s, 开爪后回抬速度
         self.release_down_default_delta = -0.08    # m, 无TF高度时保守缓降
         self.release_down_max_delta = -0.10        # m, 单次最大下放位移
-        self.place_release_extra_down = 0.010      # m, 在理论放置高度上再下压一点，避免悬空开爪
+        self.place_release_extra_down = 0.015      # m, 在理论放置高度上再下压一点，避免悬空开爪
         self.place_release_target_tol = 0.006      # m, 放置高度到位容差
         self.place_release_max_iters = 4           # 放置阶段最多步进次数
         self.place_release_step_pause_sec = 0.08   # 放置分步间停顿（过长会产生明显“停-走”）
@@ -366,7 +441,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.transport_lift_extra = 0.0            # State6额外抬升量，默认关闭避免“抬升-停顿-再抬升”
         # 退出阶段参数（必须先上抬再回 Home）
         self.return_lift_delta = 0.10
-        self.return_lift_speed = 0.020
+        self.return_lift_speed = 0.014
         self.return_lift_verify_min_abs = 0.015
         self.return_lift_verify_ratio = 0.35
         self.return_lift_retry_max = 0.06
@@ -380,12 +455,27 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.gripper_hold_opening_tolerance = 0.0018
         self.gripper_hold_refresh_sec = 0.55
         self.gripper_hold_close_bias = 0.0002
+        self.enable_gripper_sync_refine = True
+        self.gripper_sync_opening_tolerance = 0.0012
+        self.gripper_sync_refine_cycles = 2
+        self.gripper_sync_settle_sec = 0.03
+        self.gripper_sync_prefer_move_action = True    # 优先走 Move 通道，确保左右同速
+        self.gripper_sync_move_speed = 0.075           # m/s (franka Move width speed)
+        self.gripper_hold_sync_on_slip = True
         # 夹取策略：默认采用受力驱动逐步夹紧；直夹仅作为显式启用的兜底模式
         self.use_direct_grasp_close = False
         self.direct_grasp_total_width = 0.036  # m, 两指总开度（直夹兜底时使用）
         self.direct_grasp_block_margin = 0.0015
         # 夹取阶段参数（中期演示优先：能夹起优先于物理真实性）
         self.grasp_contact_threshold = 0.8
+        self.enable_fast_grasp_pipeline = False      # 平衡模式：不强制关闭兜底流程
+        self.grasp_force_calibration_enabled = False
+        self.grasp_enable_retry_cycle = True        # 首次夹紧失败后，执行一次二次下压+重夹
+        self.grasp_enable_evidence_recheck = True   # 保留一次夹后证据复核重夹，提高稳态
+        self.grasp_require_dual_side_contact = True
+        self.grasp_dual_contact_ratio = 0.55
+        self.grasp_single_side_force_ratio = 0.35
+        self.grasp_single_side_balance_tol = 0.0025
         # 预压过大会把目标压入桌面，先用小位移建立接触
         self.grasp_preload_down = 0.003
         self.grasp_preload_down_min = 0.0015
@@ -405,22 +495,22 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.grasp_object_opening_min = 0.012
         self.grasp_block_confirm_steps = 2
         self.grasp_block_margin = 0.003
-        self.grasp_close_step_main = 0.0065
-        self.grasp_close_step_retry = 0.0050
+        self.grasp_close_step_main = 0.0080
+        self.grasp_close_step_retry = 0.0060
         self.grasp_force_calibration_sec = 0.28
-        self.grasp_close_step_dwell_sec = 0.06
-        self.grasp_preload_settle_sec = 0.10
-        self.grasp_retry_settle_sec = 0.10
-        self.grasp_post_sync_settle_sec = 0.22
-        self.grasp_empty_recheck_settle_sec = 0.25
-        self.grasp_post_lift_settle_sec = 0.08
+        self.grasp_close_step_dwell_sec = 0.055
+        self.grasp_preload_settle_sec = 0.05
+        self.grasp_retry_settle_sec = 0.05
+        self.grasp_post_sync_settle_sec = 0.12
+        self.grasp_empty_recheck_settle_sec = 0.18
+        self.grasp_post_lift_settle_sec = 0.04
         self.grasp_direct_check_settle_sec = 0.20
         self.grasp_fallback_settle_sec = 0.35
         self.grasp_lock_tighten_margin = 0.0008
         # 下探安全偏置，减少“手掌先碰铝条”
         self.grasp_z_safety_bias = 0.008
         # 在当前抓取基线上额外下探 2cm（根据实测“下降不够”问题）
-        self.grasp_extra_descent = 0.020
+        self.grasp_extra_descent = 0.015
         # 当前默认使用 MoveIt2 默认规划管线（OMPL）+ 请求适配器 TOTG。
         # 如后续确实接入 CHOMP/STOMP，请在 move_group 侧显式配置 planning_pipelines 后再追加候选。
         self.sync_plan_pipeline_candidates = ['']
@@ -512,6 +602,10 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
                 self.current_joint_velocity[name] = 0.0
         self._last_joint_state_stamp_sec = stamp_sec
 
+    def _native_exec_status_cb(self, msg: String):
+        self.native_exec_status = str(getattr(msg, 'data', '')).strip().lower()
+        self.native_exec_status_stamp_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+
     def _left_force_cb(self, msg: WrenchStamped):
         self.current_left_wrench = msg
 
@@ -563,7 +657,18 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             p_right[1] = center_y - half_gap
             spacing_forced = True
 
+        x_span_before = abs(float(p_left[0]) - float(p_right[0]))
+        x_locked = False
+        if bool(getattr(self, 'pregrasp_centerline_x_lock', True)):
+            x_lock_tol = max(0.0, float(getattr(self, 'pregrasp_centerline_x_lock_tol', 0.03)))
+            if x_span_before <= x_lock_tol:
+                center_x = float(center_p[0])
+                p_left[0] = center_x
+                p_right[0] = center_x
+                x_locked = True
+
         y_spacing_after = abs(float(p_left[1]) - float(p_right[1]))
+        x_span_after = abs(float(p_left[0]) - float(p_right[0]))
         return p_left, p_right, {
             'axis_name': axis_name,
             'span': span,
@@ -574,6 +679,9 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             'y_spacing_before': y_spacing_before,
             'y_spacing_after': y_spacing_after,
             'min_lateral_spacing': min_lateral_spacing,
+            'x_span_before': x_span_before,
+            'x_span_after': x_span_after,
+            'x_locked': x_locked,
         }
 
     def _action_status_is_success(self, status: int) -> bool:
@@ -799,7 +907,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.get_logger().error(f"无法获取 {frames} 的 TF，使用备选硬编码位姿！")
         pose.pose.position.x = 0.5
         pose.pose.position.y = 0.0
-        pose.pose.position.z = 0.36
+        pose.pose.position.z = 0.16
         pose.pose.orientation.w = 1.0
         self.target_pose_from_tf = False
         self.target_pose_source_frame = 'hardcoded_fallback'
@@ -864,17 +972,25 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             self.gripper_wait_result = False
             self.accept_aborted_as_success = True
             self.midterm_demo_mode = True
-            self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.045)
+            self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.050)
             self.watchdog_force_limit = 130.0
             self.watchdog_force_trip_count = 3
             # Demo 模式：预抓取门控采用软判定，避免毫米级误差触发整条任务失败
             self.strict_pregrasp_gate = False
             self.enable_pregrasp_force_align = True
-            self.pregrasp_align_xy_tol = max(float(getattr(self, 'pregrasp_align_xy_tol', 0.003)), 0.008)
+            self.pregrasp_align_xy_tol = max(float(getattr(self, 'pregrasp_align_xy_tol', 0.003)), 0.005)
+            self.pregrasp_align_x_tol = min(
+                max(float(getattr(self, 'pregrasp_align_x_tol', 0.002)), 0.0015), 0.004)
+            self.pregrasp_align_pair_x_tol = min(
+                max(float(getattr(self, 'pregrasp_align_pair_x_tol', 0.003)), 0.0020), 0.004)
             self.pregrasp_align_z_tol = max(float(getattr(self, 'pregrasp_align_z_tol', 0.003)), 0.006)
             self.pregrasp_align_z_gap_tol = max(float(getattr(self, 'pregrasp_align_z_gap_tol', 0.002)), 0.010)
             self.pregrasp_refine_pos_tol = max(float(getattr(self, 'pregrasp_refine_pos_tol', 0.004)), 0.006)
-            self.pregrasp_force_align_xy_tol = max(float(getattr(self, 'pregrasp_force_align_xy_tol', 0.003)), 0.008)
+            self.pregrasp_force_align_xy_tol = max(float(getattr(self, 'pregrasp_force_align_xy_tol', 0.003)), 0.005)
+            self.pregrasp_force_align_x_tol = min(
+                max(float(getattr(self, 'pregrasp_force_align_x_tol', 0.002)), 0.0015), 0.004)
+            self.pregrasp_force_align_pair_x_tol = min(
+                max(float(getattr(self, 'pregrasp_force_align_pair_x_tol', 0.003)), 0.0020), 0.004)
             self.pregrasp_force_align_z_gap_tol = max(float(getattr(self, 'pregrasp_force_align_z_gap_tol', 0.002)), 0.010)
             self.pregrasp_force_align_pos_tol = max(float(getattr(self, 'pregrasp_force_align_pos_tol', 0.003)), 0.006)
             self.get_logger().info(
@@ -886,14 +1002,18 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.gripper_wait_result = True
         self.accept_aborted_as_success = False
         self.midterm_demo_mode = False
-        self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.035)
+        self.max_servo_linear_speed = min(float(getattr(self, 'max_servo_linear_speed', 0.045)), 0.040)
         self.watchdog_force_limit = min(float(getattr(self, 'watchdog_force_limit', 130.0)), 100.0)
         self.watchdog_force_trip_count = min(max(int(getattr(self, 'watchdog_force_trip_count', 3)), 1), 2)
         self.strict_pregrasp_gate = True
         self.pregrasp_align_xy_tol = min(float(getattr(self, 'pregrasp_align_xy_tol', 0.008)), 0.004)
+        self.pregrasp_align_x_tol = min(float(getattr(self, 'pregrasp_align_x_tol', 0.004)), 0.0025)
+        self.pregrasp_align_pair_x_tol = min(float(getattr(self, 'pregrasp_align_pair_x_tol', 0.005)), 0.0035)
         self.pregrasp_align_z_tol = min(float(getattr(self, 'pregrasp_align_z_tol', 0.006)), 0.004)
         self.pregrasp_align_z_gap_tol = min(float(getattr(self, 'pregrasp_align_z_gap_tol', 0.010)), 0.004)
         self.pregrasp_force_align_xy_tol = min(float(getattr(self, 'pregrasp_force_align_xy_tol', 0.008)), 0.004)
+        self.pregrasp_force_align_x_tol = min(float(getattr(self, 'pregrasp_force_align_x_tol', 0.004)), 0.0025)
+        self.pregrasp_force_align_pair_x_tol = min(float(getattr(self, 'pregrasp_force_align_pair_x_tol', 0.005)), 0.0035)
         self.pregrasp_force_align_z_gap_tol = min(float(getattr(self, 'pregrasp_force_align_z_gap_tol', 0.010)), 0.004)
         self.get_logger().info(
             "运行模式=eval：严格判定流程；动作仅 SUCCEEDED 才算成功。")
@@ -1074,6 +1194,46 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             return {c.name: c.state for c in result.controller}
         except Exception:
             return {}
+
+    async def _ensure_controller_loaded_async(self, controller_name: str):
+        """
+        确保 controller_manager 中已注册该控制器。
+        若已注册则直接返回 True；若未注册则尝试 load + configure。
+        """
+        controller_name = str(controller_name).strip()
+        if not controller_name:
+            return False
+
+        controllers = await self._list_controllers_async()
+        if controller_name in controllers:
+            return True
+
+        if not self.load_ctrl_client.wait_for_service(timeout_sec=1.0):
+            return False
+        try:
+            req_load = LoadController.Request()
+            req_load.name = controller_name
+            load_res = await asyncio.wait_for(
+                self.load_ctrl_client.call_async(req_load), timeout=3.0
+            )
+            if not bool(getattr(load_res, 'ok', False)):
+                return False
+        except Exception:
+            return False
+
+        # controller manager 新版本会自动 configure；旧版本需显式请求
+        if self.configure_ctrl_client.wait_for_service(timeout_sec=0.5):
+            try:
+                req_cfg = ConfigureController.Request()
+                req_cfg.name = controller_name
+                await asyncio.wait_for(
+                    self.configure_ctrl_client.call_async(req_cfg), timeout=3.0
+                )
+            except Exception:
+                pass
+
+        controllers = await self._list_controllers_async()
+        return controller_name in controllers
 
     async def _switch_controllers_async(self, activate, deactivate):
         if not activate and not deactivate:
@@ -1507,6 +1667,24 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
                 missing.append('right')
             self.get_logger().warn(
                 f"同步规划失败（失败侧={','.join(missing) if missing else 'unknown'}），降级为顺序移动")
+
+            # 在降级为“顺序单臂”前，优先尝试双臂笛卡尔同步回退，减少节拍差
+            if bool(getattr(self, 'sync_move_cartesian_fallback_on_plan_fail', True)):
+                cart_ok = await self._move_dual_cartesian_to_targets(
+                    left_goal=left_pose,
+                    right_goal=right_pose,
+                    description="sync_move_arms规划失败回退(双臂笛卡尔)",
+                    max_step=float(getattr(self, 'sync_move_cartesian_fallback_max_step', 0.004)),
+                    target_speed=float(getattr(self, 'sync_move_cartesian_fallback_speed', 0.010)),
+                    avoid_collisions=False,
+                    fraction_threshold=max(
+                        0.80, float(getattr(self, 'sync_move_cartesian_fallback_fraction_threshold', 0.92))
+                    ),
+                )
+                if cart_ok:
+                    self.get_logger().info("已通过双臂笛卡尔回退完成同步移动")
+                    return True
+                self.get_logger().warn("双臂笛卡尔回退失败，继续降级为顺序移动")
         
         # 顺序移动（备选方案）
         left_ok = await self.move_arm_to_pose_async(
@@ -1784,6 +1962,34 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             f"开始主搬运旋转: center=({center_xy[0]:.3f},{center_xy[1]:.3f})[{center_source}], "
             f"total={total_deg:.1f}deg, step={step_deg:.2f}deg x {step_count}")
 
+        if bool(getattr(self, 'use_native_state6_executor', False)):
+            native_exec = getattr(self, 'execute_native_state6_rotate', None)
+            if callable(native_exec):
+                ok_native = await native_exec(
+                    center_xy=center_xy,
+                    total_deg=total_deg,
+                    step_limit_deg=step_limit,
+                    rotate_orientation=rotate_orientation,
+                    max_step=float(getattr(self, 'transport_rotate_cartesian_max_step', 0.004)),
+                    target_speed=float(getattr(self, 'transport_rotate_speed', 0.010)),
+                    time_scale=float(getattr(self, 'sync_merge_time_scale', 1.2)),
+                    try_without_orientation=bool(
+                        getattr(self, 'transport_rotate_try_without_orientation', False)
+                    ),
+                    avoid_collisions=bool(getattr(self, 'transport_rotate_avoid_collisions', True)),
+                    fraction_threshold=float(
+                        getattr(self, 'transport_rotate_cartesian_fraction_threshold', 0.94)
+                    ),
+                    settle_sec=settle_sec,
+                    description=f"State6旋转任务[native:{center_source}]",
+                )
+                if ok_native:
+                    self.get_logger().info("✓ 中心旋转任务完成(native)，进入开爪放置阶段")
+                    await asyncio.sleep(max(0.0, float(getattr(self, 'state_transition_pause_sec', 0.08))))
+                    self.current_state = TaskState.OPEN_GRIPPERS
+                    return
+                self.get_logger().warn("State6 native 旋转任务失败，回退 Python 步进执行")
+
         for idx in range(step_count):
             ok_step = await self._execute_rotation_step_about_center(
                 center_xy=center_xy,
@@ -1896,8 +2102,21 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
 
         vel_name = str(getattr(self, 'dual_joint_velocity_controller_name', 'dual_joint_group_velocity_controller'))
         if vel_name not in controllers:
-            self.get_logger().warn(f"串级 PID: 未找到速度控制器 {vel_name}")
-            return False
+            # 尝试运行时动态加载（支持 launch 仅启动轨迹控制器的场景）
+            loaded = await self._ensure_controller_loaded_async(vel_name)
+            if loaded:
+                controllers = await self._list_controllers_async()
+                self.get_logger().info(f"串级 PID: 已动态加载速度控制器 {vel_name}")
+            else:
+                if not bool(getattr(self, '_cascade_pid_controller_missing_warned', False)):
+                    self.get_logger().warn(
+                        f"串级 PID: 未找到速度控制器 {vel_name}，将回退 FollowJointTrajectory"
+                    )
+                    self._cascade_pid_controller_missing_warned = True
+                # 避免每段轨迹都重复触发同一告警，自动降级到 FJT 链路
+                self.use_cascade_joint_pid = False
+                return False
+        self._cascade_pid_controller_missing_warned = False
 
         activate = []
         deactivate = []
@@ -2087,6 +2306,435 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
                     await self.switch_to_trajectory_mode()
                 except Exception as e:
                     self.get_logger().warn(f"串级 PID: 恢复轨迹控制器失败: {e}")
+
+    async def _execute_merged_trajectory_native(self, merged, total_sec: float) -> bool:
+        """通过 C/C++ 原生节点执行已合并轨迹；失败时由上层自动回退本地执行。"""
+        if self.native_merged_traj_pub is None:
+            self.get_logger().warn("原生执行器桥接不可用：native_merged_traj_pub 为空")
+            return False
+
+        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+
+        try:
+            # 双发一次，降低跨节点启动瞬间漏收概率
+            self.native_merged_traj_pub.publish(merged)
+            await asyncio.sleep(0.01)
+            self.native_merged_traj_pub.publish(merged)
+        except Exception as e:
+            self.get_logger().warn(f"发布原生执行轨迹失败: {e}")
+            return False
+
+        timeout_sec = max(
+            5.0,
+            float(total_sec) + float(getattr(self, 'native_executor_result_timeout_pad_sec', 4.0))
+        )
+        deadline = start_sec + timeout_sec
+        executing_seen = False
+
+        while True:
+            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            if now_sec >= deadline:
+                self.get_logger().warn(
+                    f"原生执行器等待超时: timeout={timeout_sec:.2f}s, last_status={self.native_exec_status}")
+                return False
+
+            status = str(getattr(self, 'native_exec_status', '')).strip().lower()
+            status_stamp = float(getattr(self, 'native_exec_status_stamp_sec', 0.0))
+            if status_stamp >= start_sec - 1e-6:
+                if status == 'executing':
+                    executing_seen = True
+                elif status in ('succeeded', 'failed'):
+                    self.get_logger().info(
+                        f"原生执行器结果: status={status}, executing_seen={executing_seen}")
+                    return status == 'succeeded'
+
+            await asyncio.sleep(0.02)
+
+    async def execute_native_cartesian_delta(
+        self,
+        delta_x: float = 0.0,
+        delta_y: float = 0.0,
+        delta_z: float = 0.0,
+        max_step: float = None,
+        target_speed: float = None,
+        time_scale: float = None,
+        description: str = "native_cartesian_delta",
+    ) -> bool:
+        """通过原生节点执行双臂笛卡尔 delta。"""
+        if self.native_cartesian_cmd_pub is None:
+            self.get_logger().warn(f"{description}: native_cartesian_cmd_pub 为空")
+            return False
+
+        if max_step is None:
+            max_step = float(getattr(self, 'transport_cartesian_max_step', 0.006))
+        if target_speed is None:
+            target_speed = float(getattr(self, 'cooperative_cartesian_speed', 0.020))
+        if time_scale is None:
+            time_scale = float(getattr(self, 'sync_merge_time_scale', 1.2))
+
+        cmd = Float64MultiArray()
+        cmd.data = [
+            float(delta_x), float(delta_y), float(delta_z),
+            float(max_step), float(target_speed), float(time_scale),
+        ]
+
+        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+
+        try:
+            self.native_cartesian_cmd_pub.publish(cmd)
+            await asyncio.sleep(0.01)
+            self.native_cartesian_cmd_pub.publish(cmd)
+        except Exception as e:
+            self.get_logger().warn(f"{description}: 发布原生命令失败: {e}")
+            return False
+
+        dist = float(np.linalg.norm([float(delta_x), float(delta_y), float(delta_z)]))
+        nominal = dist / max(0.005, float(target_speed))
+        timeout_sec = max(
+            6.0,
+            float(nominal) + float(getattr(self, 'native_executor_result_timeout_pad_sec', 4.0))
+        )
+        deadline = start_sec + timeout_sec
+        executing_seen = False
+
+        while True:
+            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            if now_sec >= deadline:
+                self.get_logger().warn(
+                    f"{description}: 原生执行等待超时 timeout={timeout_sec:.2f}s, "
+                    f"last_status={self.native_exec_status}")
+                return False
+
+            status = str(getattr(self, 'native_exec_status', '')).strip().lower()
+            status_stamp = float(getattr(self, 'native_exec_status_stamp_sec', 0.0))
+            if status_stamp >= start_sec - 1e-6:
+                if status == 'executing':
+                    executing_seen = True
+                elif status in ('succeeded', 'failed'):
+                    self.get_logger().info(
+                        f"{description}: 原生执行结果 status={status}, executing_seen={executing_seen}")
+                    return status == 'succeeded'
+            await asyncio.sleep(0.02)
+
+    async def execute_native_cartesian_targets(
+        self,
+        left_goal: PoseStamped,
+        right_goal: PoseStamped,
+        max_step: float = None,
+        target_speed: float = None,
+        time_scale: float = None,
+        avoid_collisions: bool = False,
+        description: str = "native_cartesian_targets",
+    ) -> bool:
+        """通过原生节点执行双臂绝对目标位姿对齐。"""
+        if self.native_cartesian_targets_pub is None:
+            self.get_logger().warn(f"{description}: native_cartesian_targets_pub 为空")
+            return False
+        if left_goal is None or right_goal is None:
+            self.get_logger().warn(f"{description}: 目标位姿为空")
+            return False
+
+        if max_step is None:
+            max_step = float(getattr(self, 'transport_cartesian_max_step', 0.006))
+        if target_speed is None:
+            target_speed = float(getattr(self, 'cooperative_cartesian_speed', 0.020))
+        if time_scale is None:
+            time_scale = float(getattr(self, 'sync_merge_time_scale', 1.2))
+
+        cmd = Float64MultiArray()
+        cmd.data = [
+            float(left_goal.pose.position.x),
+            float(left_goal.pose.position.y),
+            float(left_goal.pose.position.z),
+            float(left_goal.pose.orientation.x),
+            float(left_goal.pose.orientation.y),
+            float(left_goal.pose.orientation.z),
+            float(left_goal.pose.orientation.w),
+            float(right_goal.pose.position.x),
+            float(right_goal.pose.position.y),
+            float(right_goal.pose.position.z),
+            float(right_goal.pose.orientation.x),
+            float(right_goal.pose.orientation.y),
+            float(right_goal.pose.orientation.z),
+            float(right_goal.pose.orientation.w),
+            float(max_step),
+            float(target_speed),
+            float(time_scale),
+            1.0 if bool(avoid_collisions) else 0.0,
+        ]
+
+        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+
+        try:
+            self.native_cartesian_targets_pub.publish(cmd)
+            await asyncio.sleep(0.01)
+            self.native_cartesian_targets_pub.publish(cmd)
+        except Exception as e:
+            self.get_logger().warn(f"{description}: 发布原生命令失败: {e}")
+            return False
+
+        left_dist = 0.0
+        right_dist = 0.0
+        try:
+            left_now, _ = await self.get_current_pose('mj_left_link8')
+            right_now, _ = await self.get_current_pose('mj_right_link8')
+            if left_now is not None:
+                left_dist = float(np.linalg.norm([
+                    float(left_goal.pose.position.x) - float(left_now[0]),
+                    float(left_goal.pose.position.y) - float(left_now[1]),
+                    float(left_goal.pose.position.z) - float(left_now[2]),
+                ]))
+            if right_now is not None:
+                right_dist = float(np.linalg.norm([
+                    float(right_goal.pose.position.x) - float(right_now[0]),
+                    float(right_goal.pose.position.y) - float(right_now[1]),
+                    float(right_goal.pose.position.z) - float(right_now[2]),
+                ]))
+        except Exception:
+            pass
+        dist = max(left_dist, right_dist)
+        nominal = dist / max(0.005, float(target_speed))
+        timeout_sec = max(
+            6.0,
+            float(nominal) + float(getattr(self, 'native_executor_result_timeout_pad_sec', 4.0))
+        )
+        deadline = start_sec + timeout_sec
+        executing_seen = False
+
+        while True:
+            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            if now_sec >= deadline:
+                self.get_logger().warn(
+                    f"{description}: 原生执行等待超时 timeout={timeout_sec:.2f}s, "
+                    f"last_status={self.native_exec_status}")
+                return False
+
+            status = str(getattr(self, 'native_exec_status', '')).strip().lower()
+            status_stamp = float(getattr(self, 'native_exec_status_stamp_sec', 0.0))
+            if status_stamp >= start_sec - 1e-6:
+                if status == 'executing':
+                    executing_seen = True
+                elif status in ('succeeded', 'failed'):
+                    self.get_logger().info(
+                        f"{description}: 原生执行结果 status={status}, executing_seen={executing_seen}")
+                    return status == 'succeeded'
+            await asyncio.sleep(0.02)
+
+    async def execute_native_state6_translate(
+        self,
+        lift_dz: float,
+        transport_dx: float,
+        transport_dy: float,
+        transport_dz: float,
+        max_step: float = None,
+        lift_speed: float = None,
+        transport_speed: float = None,
+        time_scale: float = None,
+        transport_one_shot_segment: float = None,
+        transport_retry_segment: float = None,
+        description: str = "native_state6_translate",
+    ) -> bool:
+        """通过原生节点执行 State6 平移任务（补偿抬升 + 主搬运平移）。"""
+        if self.native_state6_task_pub is None:
+            self.get_logger().warn(f"{description}: native_state6_task_pub 为空")
+            return False
+
+        if max_step is None:
+            max_step = float(getattr(self, 'transport_cartesian_max_step', 0.006))
+        if lift_speed is None:
+            lift_speed = float(getattr(self, 'cooperative_lift_speed', 0.020))
+        if transport_speed is None:
+            transport_speed = float(getattr(self, 'cooperative_transport_speed', 0.018))
+        if time_scale is None:
+            time_scale = float(getattr(self, 'sync_merge_time_scale', 1.2))
+        if transport_one_shot_segment is None:
+            transport_one_shot_segment = float(
+                getattr(self, 'transport_cartesian_one_shot_margin', 0.02)
+            ) + float(np.linalg.norm([transport_dx, transport_dy, transport_dz]))
+        if transport_retry_segment is None:
+            transport_retry_segment = float(getattr(self, 'transport_cartesian_retry_segment', 0.08))
+
+        cmd = Float64MultiArray()
+        cmd.data = [
+            0.0,  # mode=0: translate
+            float(lift_dz),
+            float(transport_dx),
+            float(transport_dy),
+            float(transport_dz),
+            float(max_step),
+            float(lift_speed),
+            float(transport_speed),
+            float(time_scale),
+            float(max(0.02, transport_one_shot_segment)),
+            float(max(0.02, transport_retry_segment)),
+        ]
+
+        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+
+        try:
+            self.native_state6_task_pub.publish(cmd)
+            await asyncio.sleep(0.01)
+            self.native_state6_task_pub.publish(cmd)
+        except Exception as e:
+            self.get_logger().warn(f"{description}: 发布原生命令失败: {e}")
+            return False
+
+        lift_nominal = abs(float(lift_dz)) / max(0.005, float(lift_speed))
+        transport_dist = float(np.linalg.norm([float(transport_dx), float(transport_dy), float(transport_dz)]))
+        transport_nominal = transport_dist / max(0.005, float(transport_speed))
+        nominal = lift_nominal + transport_nominal
+        timeout_sec = max(
+            8.0,
+            float(nominal) + float(getattr(self, 'native_executor_result_timeout_pad_sec', 4.0)),
+        )
+        deadline = start_sec + timeout_sec
+        executing_seen = False
+
+        while True:
+            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            if now_sec >= deadline:
+                self.get_logger().warn(
+                    f"{description}: 原生执行等待超时 timeout={timeout_sec:.2f}s, "
+                    f"last_status={self.native_exec_status}")
+                return False
+
+            status = str(getattr(self, 'native_exec_status', '')).strip().lower()
+            status_stamp = float(getattr(self, 'native_exec_status_stamp_sec', 0.0))
+            if status_stamp >= start_sec - 1e-6:
+                if status == 'executing':
+                    executing_seen = True
+                elif status in ('succeeded', 'failed'):
+                    self.get_logger().info(
+                        f"{description}: 原生执行结果 status={status}, executing_seen={executing_seen}")
+                    return status == 'succeeded'
+            await asyncio.sleep(0.02)
+
+    async def execute_native_state6_rotate(
+        self,
+        center_xy,
+        total_deg: float,
+        step_limit_deg: float = None,
+        rotate_orientation: bool = True,
+        max_step: float = None,
+        target_speed: float = None,
+        time_scale: float = None,
+        try_without_orientation: bool = False,
+        avoid_collisions: bool = False,
+        fraction_threshold: float = None,
+        settle_sec: float = None,
+        description: str = "native_state6_rotate",
+    ) -> bool:
+        """通过原生节点执行 State6 中心旋转任务。"""
+        if self.native_state6_task_pub is None:
+            self.get_logger().warn(f"{description}: native_state6_task_pub 为空")
+            return False
+
+        if center_xy is None or len(center_xy) < 2:
+            self.get_logger().warn(f"{description}: center_xy 非法")
+            return False
+
+        if step_limit_deg is None:
+            step_limit_deg = float(getattr(self, 'transport_rotate_step_deg', 3.0))
+        if max_step is None:
+            max_step = float(getattr(self, 'transport_rotate_cartesian_max_step', 0.004))
+        if target_speed is None:
+            target_speed = float(getattr(self, 'transport_rotate_speed', 0.010))
+        if time_scale is None:
+            time_scale = float(getattr(self, 'sync_merge_time_scale', 1.2))
+        if fraction_threshold is None:
+            fraction_threshold = float(getattr(self, 'transport_rotate_cartesian_fraction_threshold', 0.94))
+        if settle_sec is None:
+            settle_sec = float(getattr(self, 'transport_rotate_settle_sec', 0.02))
+
+        cmd = Float64MultiArray()
+        cmd.data = [
+            1.0,  # mode=1: rotate
+            float(center_xy[0]),
+            float(center_xy[1]),
+            float(total_deg),
+            float(max(2.0, abs(step_limit_deg))),
+            1.0 if bool(rotate_orientation) else 0.0,
+            float(max_step),
+            float(target_speed),
+            float(time_scale),
+            1.0 if bool(try_without_orientation) else 0.0,
+            1.0 if bool(avoid_collisions) else 0.0,
+            float(max(0.50, min(0.999, float(fraction_threshold)))),
+            float(max(0.0, float(settle_sec))),
+        ]
+
+        start_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        self.native_exec_status = ''
+        self.native_exec_status_stamp_sec = 0.0
+
+        try:
+            self.native_state6_task_pub.publish(cmd)
+            await asyncio.sleep(0.01)
+            self.native_state6_task_pub.publish(cmd)
+        except Exception as e:
+            self.get_logger().warn(f"{description}: 发布原生命令失败: {e}")
+            return False
+
+        step_count = max(1, int(np.ceil(abs(float(total_deg)) / max(2.0, abs(float(step_limit_deg))))))
+        radius_max = 0.12
+        try:
+            left_now, _ = await self.get_current_pose('mj_left_link8')
+            right_now, _ = await self.get_current_pose('mj_right_link8')
+            if left_now is not None:
+                radius_max = max(
+                    radius_max,
+                    float(np.linalg.norm([
+                        float(left_now[0]) - float(center_xy[0]),
+                        float(left_now[1]) - float(center_xy[1]),
+                    ])),
+                )
+            if right_now is not None:
+                radius_max = max(
+                    radius_max,
+                    float(np.linalg.norm([
+                        float(right_now[0]) - float(center_xy[0]),
+                        float(right_now[1]) - float(center_xy[1]),
+                    ])),
+                )
+        except Exception:
+            pass
+
+        arc_len = np.deg2rad(abs(float(total_deg))) * max(0.03, float(radius_max))
+        nominal = max(1.5, float(arc_len) / max(0.005, float(target_speed)))
+        nominal += 0.35 * float(step_count)
+        timeout_sec = max(
+            10.0,
+            float(nominal) + float(getattr(self, 'native_executor_result_timeout_pad_sec', 4.0)),
+        )
+        deadline = start_sec + timeout_sec
+        executing_seen = False
+
+        while True:
+            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            if now_sec >= deadline:
+                self.get_logger().warn(
+                    f"{description}: 原生执行等待超时 timeout={timeout_sec:.2f}s, "
+                    f"last_status={self.native_exec_status}")
+                return False
+
+            status = str(getattr(self, 'native_exec_status', '')).strip().lower()
+            status_stamp = float(getattr(self, 'native_exec_status_stamp_sec', 0.0))
+            if status_stamp >= start_sec - 1e-6:
+                if status == 'executing':
+                    executing_seen = True
+                elif status in ('succeeded', 'failed'):
+                    self.get_logger().info(
+                        f"{description}: 原生执行结果 status={status}, executing_seen={executing_seen}")
+                    return status == 'succeeded'
+            await asyncio.sleep(0.02)
 
     async def _execute_merged_trajectory(self, left_traj, right_traj, time_scale=1.3):
         """将左右臂轨迹等时参数化合并为14-DOF轨迹并通过 dual_controller 执行"""
@@ -2298,6 +2946,12 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             merged.points[-1].velocities = [0.0] * n_joints
 
         total_sec = float(t_unified[-1]) if t_unified else 0.0
+        if bool(getattr(self, 'use_native_trajectory_executor', False)):
+            ok_native = await self._execute_merged_trajectory_native(merged, total_sec=total_sec)
+            if ok_native:
+                return True
+            self.get_logger().warn("原生执行器执行失败，回退本地执行链路")
+
         if bool(getattr(self, 'use_cascade_joint_pid', True)):
             ok_cascade = await self._execute_merged_trajectory_cascade_pid(merged, t_unified)
             if ok_cascade:
@@ -2665,7 +3319,7 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
             t.child_frame_id = 'target_bar'
             t.transform.translation.x = 0.5
             t.transform.translation.y = 0.0
-            t.transform.translation.z = 0.36
+            t.transform.translation.z = 0.16
             t.transform.rotation.w = 1.0
             self.tf_broadcaster.sendTransform(t)
             self.get_logger().warn(
@@ -2703,21 +3357,25 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.get_logger().info(
             f"抓取轴判定={grasp_meta['axis_name']} "
             f"(||lx_h||={grasp_meta['lx_norm']:.4f}, ||ly_h||={grasp_meta['ly_norm']:.4f}, eps={grasp_meta['tie_eps']:.1e}), "
-            f"Y间距={grasp_meta['y_spacing_after']:.4f}m")
+            f"Y间距={grasp_meta['y_spacing_after']:.4f}m, X差={grasp_meta.get('x_span_after', 0.0):.4f}m")
         if grasp_meta['spacing_forced']:
             self.get_logger().warn(
                 f"预抓取防撞保护触发: Y间距从 {grasp_meta['y_spacing_before']:.4f}m "
                 f"提升至 {grasp_meta['y_spacing_after']:.4f}m (最小要求 {grasp_meta['min_lateral_spacing']:.4f}m)")
+        if grasp_meta.get('x_locked', False):
+            self.get_logger().info(
+                f"预抓取中心线X锁定已启用: X差 {grasp_meta.get('x_span_before', 0.0):.4f}m "
+                f"-> {grasp_meta.get('x_span_after', 0.0):.4f}m")
         
         # 为了后续状态机使用，将numpy数组存为成员变量
         self.left_grasp_center_pos = left_grasp_center
         self.right_grasp_center_pos = right_grasp_center
         self.target_object_orientation = target_pose.pose.orientation # 保存姿态给后续使用
 
-        # === 高度计算（从 dual_scene.xml + mj_dual.xml 精确推导）===
-        # 桌子: pos="0.5 0 0.2", size半高=0.14 → 桌面 z = 0.2+0.14 = 0.34m
-        # 铝条静止后中心 z = 桌面(0.34) + 半高(0.02) = 0.36m
-        self.TABLE_TOP_Z = 0.34
+        # === 高度计算（从 dual_scene.xml + mj_dual.xml 推导）===
+        # 当前桌子: pos z=0.0, 半高=0.14 → 桌面 z = 0.14m
+        # 铝条静止后中心 z = 桌面 + 半高(0.02) = 0.16m
+        self.TABLE_TOP_Z = 0.14
         self.BAR_RESTING_Z = target_pose.pose.position.z # 使用动态获取的高度
 
         if bool(getattr(self, 'publish_mock_target_tf', False)):
@@ -2752,11 +3410,11 @@ class DualArmTaskNode(Node, GripperOpsMixin, ServoOpsMixin, StateOpsMixin):
         self.GRASP_OFFSET_Y_LEFT  =  0.10
         self.GRASP_OFFSET_Y_RIGHT = -0.10
         
-        # link8 目标高度 = 铝条中心(0.36) + TCP偏移(0.1034) = 0.4634
+        # link8 目标高度 = 铝条中心(BAR_RESTING_Z) + TCP偏移(0.1034)
         # 手指夹持中心对准铝条中心，无需额外余量
-        self.GRASP_Z = self.BAR_RESTING_Z + self.TCP_OFFSET   # 0.4634
-        self.PRE_GRASP_HEIGHT = self.GRASP_Z + 0.12            # 0.5834 (预抓取高于 12cm)
-        self.LIFT_HEIGHT = self.GRASP_Z + 0.15                 # 0.6134 (提升 15cm)
+        self.GRASP_Z = self.BAR_RESTING_Z + self.TCP_OFFSET
+        self.PRE_GRASP_HEIGHT = self.GRASP_Z + 0.12            # 预抓取高于 12cm
+        self.LIFT_HEIGHT = self.GRASP_Z + 0.15                 # 抬升 15cm
         if self._is_rotate_transport_mode():
             # 旋转任务下不使用平移偏移量
             self.TRANSPORT_X_OFFSET = 0.00

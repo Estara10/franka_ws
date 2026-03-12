@@ -111,7 +111,12 @@ class GripperOpsMixin:
 
         goal = self._franka_move_action_type.Goal()
         goal.width = max(0.0, min(0.08, float(position) * 2.0))
-        goal.speed = float(getattr(self, 'gripper_move_speed', 0.08))
+        move_speed = float(getattr(
+            self,
+            'gripper_sync_move_speed',
+            getattr(self, 'gripper_move_speed', 0.08),
+        ))
+        goal.speed = max(0.005, min(0.20, move_speed))
         try:
             goal_handle = await asyncio.wait_for(
                 client.send_goal_async(goal),
@@ -209,14 +214,17 @@ class GripperOpsMixin:
             )
 
             try:
-                if slip_left:
-                    await self.control_gripper_async(
-                        'left', close_target, effort, wait_for_result=False, quiet=True)
-                    last_cmd_ts = now
-                    force_refresh = False
-                if slip_right:
-                    await self.control_gripper_async(
-                        'right', close_target, effort, wait_for_result=False, quiet=True)
+                sync_on_slip = bool(getattr(self, 'gripper_hold_sync_on_slip', True))
+                if slip_left or slip_right:
+                    if sync_on_slip:
+                        await self.sync_grasp(close_target, effort, wait_for_result=False, quiet=True)
+                    else:
+                        if slip_left:
+                            await self.control_gripper_async(
+                                'left', close_target, effort, wait_for_result=False, quiet=True)
+                        if slip_right:
+                            await self.control_gripper_async(
+                                'right', close_target, effort, wait_for_result=False, quiet=True)
                     last_cmd_ts = now
                     force_refresh = False
 
@@ -400,15 +408,100 @@ class GripperOpsMixin:
             return True
         return False
 
+    async def _refine_gripper_sync_balance(self, width: float, effort: float, quiet: bool = False) -> bool:
+        """
+        闭合/张开后做短周期同步校正，降低左右指开度差带来的“不同步”体感。
+        """
+        if not bool(getattr(self, 'enable_gripper_sync_refine', True)):
+            return True
+        cycles = max(0, int(getattr(self, 'gripper_sync_refine_cycles', 2)))
+        if cycles <= 0:
+            return True
+        tol = max(0.0002, float(getattr(self, 'gripper_sync_opening_tolerance', 0.0012)))
+        settle_sec = max(0.0, float(getattr(self, 'gripper_sync_settle_sec', 0.03)))
+        target = self._clamp_gripper_position(width)
+        effort = float(effort)
+
+        for attempt in range(1, cycles + 1):
+            if settle_sec > 1e-4:
+                await asyncio.sleep(settle_sec)
+            left_open = self.get_gripper_opening_estimate('left')
+            right_open = self.get_gripper_opening_estimate('right')
+            if left_open is None or right_open is None:
+                return True
+            diff = abs(float(left_open) - float(right_open))
+            if diff <= tol:
+                return True
+            if not quiet:
+                self.get_logger().warn(
+                    f"夹爪同步偏差过大(diff={diff:.4f} > tol={tol:.4f})，执行校正 {attempt}/{cycles}")
+            await asyncio.gather(
+                self.control_gripper_async('left', target, effort, wait_for_result=False, quiet=True),
+                self.control_gripper_async('right', target, effort, wait_for_result=False, quiet=True),
+            )
+
+        if settle_sec > 1e-4:
+            await asyncio.sleep(settle_sec)
+        left_open = self.get_gripper_opening_estimate('left')
+        right_open = self.get_gripper_opening_estimate('right')
+        if left_open is None or right_open is None:
+            return True
+        diff = abs(float(left_open) - float(right_open))
+        return diff <= tol
+
+    async def _sync_grasp_via_move_action(self, width: float, effort: float,
+                                          wait_for_result: bool = True, quiet: bool = False) -> bool:
+        """
+        优先用 franka Move 通道做左右夹爪“同速”闭合/张开，降低两侧动作节拍差异。
+        """
+        width = self._clamp_gripper_position(width)
+        left_ok, right_ok = await asyncio.gather(
+            self._control_gripper_via_move_async('left', width, wait_for_result=wait_for_result),
+            self._control_gripper_via_move_async('right', width, wait_for_result=wait_for_result),
+        )
+        if not (left_ok and right_ok):
+            return False
+
+        if wait_for_result:
+            balanced = await self._refine_gripper_sync_balance(width, effort, quiet=quiet)
+            if (not balanced) and (not quiet):
+                left_open = self.get_gripper_opening_estimate('left')
+                right_open = self.get_gripper_opening_estimate('right')
+                self.get_logger().warn(
+                    f"Move通道夹爪校正后仍有残差: left={left_open}, right={right_open}")
+        if not quiet:
+            self.get_logger().info("已通过 Move 通道完成双夹爪同步命令")
+        return True
+
     async def sync_grasp(self, width: float, effort: float, wait_for_result: bool = True,
                          quiet: bool = False):
         """同步控制双爪"""
         width = self._clamp_gripper_position(width)
+        prefer_move = bool(getattr(self, 'gripper_sync_prefer_move_action', False))
+        if prefer_move:
+            move_ok = await self._sync_grasp_via_move_action(
+                width=width,
+                effort=effort,
+                wait_for_result=wait_for_result,
+                quiet=quiet,
+            )
+            if move_ok:
+                return True
+            if not quiet:
+                self.get_logger().warn("Move 通道双爪同步失败，回退 GripperCommand 通道")
+
         left_ok, right_ok = await asyncio.gather(
             self.control_gripper_async('left', width, effort, wait_for_result, quiet=quiet),
             self.control_gripper_async('right', width, effort, wait_for_result, quiet=quiet)
         )
         if left_ok and right_ok:
+            if wait_for_result:
+                balanced = await self._refine_gripper_sync_balance(width, effort, quiet=quiet)
+                if (not balanced) and (not quiet):
+                    left_open = self.get_gripper_opening_estimate('left')
+                    right_open = self.get_gripper_opening_estimate('right')
+                    self.get_logger().warn(
+                        f"夹爪校正后仍有残差: left={left_open}, right={right_open}")
             return True
 
         traj_ok = await self._sync_grasp_via_trajectory_fallback(width, wait_for_result=wait_for_result)

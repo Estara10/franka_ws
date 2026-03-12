@@ -1,0 +1,45 @@
+dual_arm_transport_full_runner:
+  ros__parameters:
+    start_sim: true
+    start_moveit: true
+    start_native_executor: true
+    auto_shutdown: true
+
+    sim_log_path: /tmp/dual_franka_sim_cpp.log
+    moveit_log_path: /tmp/dual_moveit_cpp.log
+    native_log_path: /tmp/dual_arm_transport_native_cpp.log
+
+    state6_topic: /dual_arm_transport_native/state6_task_cmd
+    status_topic: /dual_arm_transport_native/status
+
+    startup_timeout_sec: 90.0
+    native_result_timeout_sec: 120.0
+
+    # "translate" or "rotate"
+    task_mode: translate
+
+    translate:
+      lift_dz: 0.02
+      dx: 0.10
+      dy: 0.00
+      dz: 0.00
+      max_step: 0.006
+      lift_speed: 0.020
+      transport_speed: 0.018
+      time_scale: 1.2
+      one_shot_segment: 0.16
+      retry_segment: 0.08
+
+    rotate:
+      center_x: 0.50
+      center_y: 0.00
+      total_deg: 90.0
+      step_limit_deg: 3.0
+      with_orientation: true
+      max_step: 0.004
+      target_speed: 0.010
+      time_scale: 1.2
+      try_without_orientation: true
+      avoid_collisions: true
+      fraction_threshold: 0.94
+      settle_sec: 0.02

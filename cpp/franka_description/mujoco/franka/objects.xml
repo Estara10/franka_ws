@@ -1,0 +1,75 @@
+<mujocoinclude>
+  <worldbody>
+
+    <!-- 铝合金长条棒材 (横向放置，长轴沿Y方向，用于双臂协作搬运任务) -->
+    <!-- 注意：pos Z坐标设为0.02，让物体底部刚好接触地面(物体高度4cm，中心在2cm) -->
+    <body name="obj_rod_01" pos="0.50 0.0 0.02">
+        <!-- 长方体: 40cm(长,Y方向) x 4cm(宽,X方向) x 4cm(高,Z方向), 半尺寸为 0.02 x 0.2 x 0.02 -->
+        <!-- condim=6 全摩擦(切向+扭转+滚动), friction="切向 扭转 滚动" -->
+        <!-- solref=0.02: 软接触时间常数, 避免高刚度弹飞 -->
+        <!-- density=1000: 平衡质量, 配合 kp=1200 + friction=3.0 强力夹持 -->
+        <!-- 修复：solref 0.02→0.005 + solimp 0.9/0.95→0.99/0.999，大幅提升接触刚度防止旋转时指尖滏滑 -->
+        <geom name="obj_rod_01" type="box" size="0.02 0.2 0.02" 
+              density="1000"
+              friction="3.0 0.5 0.005" 
+              condim="6"
+              solref="0.005 1" 
+              solimp="0.99 0.999 0.001" 
+              margin="0.001"
+              rgba="0.8 0.8 0.8 1"/>
+        <freejoint/>
+    </body>
+    
+    <!-- 绿色球体已删除 (与项目无关) -->
+    <!-- <body name="obj_box_02" pos="0.5 0.1 0.25">
+        <geom name="obj_box_02" type="box" size="0.03 0.03 0.05" solimp="0.998 0.998 0.001" solref="0.001 1" density="500" rgba="1 0.56 0.43 1"/>
+        <joint name="obj_box_02_joint" type="free" damping="0.0005"/>
+    </body>  -->
+    <!-- <body name="obj_box_01" pos="0.0 0.0 0.25">
+        <geom name="obj_box_01" fromto="0.0 0.0 0.5  0.0 0.0 0.0"  size="0.04" type="box" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_box_02" pos="0.0 0.0 0.25">
+        <geom name="obj_box_02" fromto="0.0 0.0 0.5  0.0 0.0 0.0"  size="0.04" type="box" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_box_03" pos="0.0 0.0 0.25">
+        <geom name="obj_box_03" fromto="0.0 0.0 0.5  0.0 0.0 0.0"  size="0.04" type="box" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_box_04" pos="0.0 0.0 0.25">
+        <geom name="obj_box_04" fromto="0.0 0.0 0.5  0.0 0.0 0.0"  size="0.04" type="box" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_box_05" pos="0.0 0.0 0.25">
+        <geom name="obj_box_05" fromto="0.0 0.0 0.5  0.0 0.0 0.0"  size="0.04" type="box" rgba="1 0.56 0.43 1"/>
+    </body>  -->
+
+    <!-- <body name="obj_box_06" pos="0.5 0.0 1.13"> -->
+        <!-- <geom name="obj_box_06" fromto="0.0 0.0 0.2 0.0 0.0 0.0" solimp="0.998 0.998 0.001" solref="0.001 1" density="500" friction="0.95 0.3 0.1" size="0.03" type="box" rgba="1 0.56 0.43 1"/> -->
+        <!-- <geom name="obj_box_06" type="box" size="0.03 0.03 0.05" solimp="0.998 0.998 0.001" solref="0.001 1" density="500" rgba="1 0.56 0.43 1"/>
+        <joint name="object_joint" type="free" damping="0.0005"/>
+    </body> -->
+
+    <!-- <body name="obj_cylinder_01" pos="0.0 0.0 0.25">
+        <geom name="obj_cylinder_01" fromto="0.0 0.0 0.5  0.0 0.0 0.0" size="0.04" type="cylinder" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_cylinder_02" pos="0.0 0.0 0.25">
+        <geom name="obj_cylinder_02" fromto="0.0 0.0 0.5  0.0 0.0 0.0" size="0.04" type="cylinder" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_cylinder_03" pos="0.0 0.0 0.25">
+        <geom name="obj_cylinder_03" fromto="0.0 0.0 0.5  0.0 0.0 0.0" size="0.04" type="cylinder" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_cylinder_04" pos="0.0 0.0 0.25">
+        <geom name="obj_cylinder_04" fromto="0.0 0.0 0.5  0.0 0.0 0.0" size="0.04" type="cylinder" rgba="1 0.56 0.43 1"/>
+    </body> 
+
+    <body name="obj_cylinder_05" pos="0.0 0.0 0.25">
+        <geom name="obj_cylinder_05" fromto="0.0 0.0 0.5  0.0 0.0 0.0" size="0.04" type="cylinder" rgba="1 0.56 0.43 1"/>
+    </body>  -->
+    
+  </worldbody>
+</mujocoinclude>
